@@ -1,0 +1,114 @@
+请根据以下规范，创建新的 GPU 程序化可视化效果 <EffectName>（.frag shader），与 Psychedelic.frag / GlitchForge.frag 具有相同的工程质量水平和架构。
+
+## 第零步：风格化数学函数参考（agent conclusion）
+
+生成新效果前，先检查 `effect reference/agent conclusion/` 文件夹。
+该文件夹存放其他 agent 总结的「风格化数学函数文件」——可复用的图案 / 变换 / 配色 / 缓动等数学函数。
+若该文件夹存在文件，优先阅读并复用其中的函数，避免重复造轮子；它们代表已验证的风格化视觉语言。
+若为空，则按本模板其余部分从零设计。
+
+## 第一步（备选）：应用根风格 + 随机种子生成效果（无参考图时）
+
+如果用户没有提供参考图，但提供了根风格文件（agent conclusion/root_style.json），
+则跳过下方「风格分析」，改用以下机制生成效果：
+
+1. 读取根风格文件，得到根种子（曲线族、矢量场、对称 N、臂数、螺旋增长率、配色、频率、纹理等）。
+2. 用一个随机种子（任意整数）对根种子做**受控扰动**，生成「根风格的变体」：
+   - 在根风格允许的范围内微调（如臂数 ±2、螺旋增长率 ±0.05、色相 ±15°、freqLow ±0.03…）
+   - 扰动幅度受「根风格变异范围」约束，保证不偏离根风格美学
+3. 每个不同的随机种子 → 一个不同的效果变体，但都共享根风格的曲线族/对称/配色基调。
+4. 把扰动后的种子交给 generator 渲染成线条/图案
+   （generator 契约见 GENERATOR_风格种子引擎设计.md，原型见 seed_generator_demo.html）。
+5. 变体效果仍需在 MAIN 或独立 exe 中肉眼验证（编译成功 ≠ 效果正确）。
+
+根风格 + 随机种子 = 「同一根美学、无限个细节变体」，无需为每个新效果重新分析图片。
+
+## 第一步：文件位置与编译契约
+
+文件：`VisualEffects/shaders/<EffectName>.frag`，GLSL `#version 330 core`。
+
+main.cpp 加载 shader 的流程：
+1. 读取 .frag 源码，去掉首行 `#version`。
+2. 前面拼接 `VisualEffects/simulation effect VST/CpuArtifact.glsl`（提供 `cpuFinalize()` / `bayer8()` / `uDitherStrength`）。
+3. 用固定顶点 shader（全屏四边形，输出 vUV）一起编译。
+
+因此 shader 内必须：
+- 声明 `in vec2 vUV; out vec4 fragColor;`
+- 不要重复定义 `cpuFinalize` / `bayer8`（已由 CpuArtifact.glsl 提供）
+- 不要写 `#version`（会被去掉后由 CpuArtifact.glsl 的 `#version 330 core` 提供）
+
+## 第二步：uniform 契约（main.cpp 绑定）
+
+main.cpp 每帧绑定的 uniform（shader 按需声明，未用到的会被编译器优化掉）：
+
+| uniform | 类型 | 含义 |
+|---------|------|------|
+| uTime | float | 全局时间（秒） |
+| uBpm | float | 当前 BPM |
+| uBeatPhase | float | 节拍相位 [0,1) |
+| uSpeed | float | 用户速度倍率 |
+| uResolution | vec2 | 窗口分辨率（像素） |
+| uForm / uFormB | int | 当前 / 目标形态索引 |
+| uFormBlend | float | 形态过渡进度 [0,1] |
+| uColorScheme | int | 配色方案索引 |
+| uProjection | int | 投影类型索引 |
+| uDarkBg | int | 黑底开关（0=白底 1=黑底） |
+| uOpacity | float | 整体不透明度 |
+| uEncode | int | Pass 1 编码开关（见第三步） |
+| uMorphBlend | float | 跨效果 morphing 进度 |
+| uOldEncoded | sampler2D | 旧效果编码纹理（Pass 2） |
+| uDitherStrength | float | CPU 质感强度 [0,1] |
+
+## 第三步：跨效果过渡（必须实现的两段逻辑）
+
+GPU 效果必须支持跨效果 morphing，两段逻辑：
+
+1. **uEncode > 0（Pass 1，编码）**：把本效果的「图案 + 颜色」写入 FBO，供下一个效果采样：
+   fragColor = vec4(pat*0.5+0.5, col);  // R=图案[0,1]，GBA=颜色
+   return;
+
+2. **uMorphBlend ∈ (0,1)（Pass 2，混合）**：
+   从 uOldEncoded 采样旧效果的图案/颜色，在图案场层面 smoothstep 混合，再映射颜色：
+   - oldPat = oldEnc.r * 2.0 - 1.0（解码旧图案）
+   - sb = uMorphBlend*uMorphBlend*(3.0-2.0*uMorphBlend)
+   - blendedPat = oldPat*(1-sb) + pat*sb
+   - newCol = mapColor(uColorScheme, blendedPat, ...)
+   - col = mix(oldCol, newCol, sb)
+
+## 第四步：坐标与分辨率无关性
+
+GPU 是窗口多大渲染多大（1:1，glViewport(0,0,w,h)），但 shader 仍必须用归一化坐标：
+
+```glsl
+float cx = uResolution.x * 0.5, cy = uResolution.y * 0.5;
+float mr = min(cx, cy);
+vec2 uv = (gl_FragCoord.xy - vec2(cx, cy)) / mr;  // 归一化，短边为半径
+```
+
+禁止直接用 gl_FragCoord 的原始像素值参与形态/配色计算。
+
+## 第五步：结构（与 CPU 版 1:1 对齐）
+
+形态/投影/配色三大函数与 CPU 版 IProceduralEffect 一一对应：
+- evalForm(f, r, theta, t, speed) — 形态函数（≥4 种）
+- mapProjection(proj, r, theta, speed) — 投影变换（≥4 种）
+- mapColor(cs, pattern, r, theta, phase) — 配色（≥4 种，含 T0 白底淡区）
+
+hsl2rgb 工具函数每个 shader 自带（或从已有 shader 复制）。
+
+## 第六步：输出与收尾
+
+main() 末尾必须走 CPU 质感管线：
+col = cpuFinalize(col, gl_FragCoord.xy, uDitherStrength);
+fragColor = vec4(col, uOpacity);
+
+## 第七步：集成到 MAIN.exe
+
+1. main.cpp 的 LoadEffects() 里 names[] 数组加上 <EffectName>
+2. CMakeLists.txt 无需改动（shader 是运行时加载，不参与编译）
+3. 重新编译 MAIN.exe 验证（编译前先关闭运行中的 MAIN.exe，否则 LNK1104 链接失败）
+
+## 性能要求
+
+- GPU 每像素成本低，但避免每像素 > 20 次 trig
+- 纹理采样、条件分支保持精简（GLSL 非 uniform 分支会全路径求值）
