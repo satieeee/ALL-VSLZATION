@@ -1,0 +1,20 @@
+SLOT 0
+Psychedelic|Azurite|7|1.000|1
+Verdigris|Azurite_c|3|0.800|1
+GlitchForge|Verdigris|2|0.340|1
+Azurite_c|Psychedelic|3|0.670|1
+Verdigris|GlitchForge|3|0.670|1
+GlitchForge|Azurite|3|0.670|1
+MTH|GlitchForge|3|0.560|1
+Azurite_c|MTH_C|3|0.560|1
+Verdigris|MTH|1|0.360|1
+Psychedelic|MTH_C|5|0.360|1
+SLOT 1
+Psychedelic|Azurite|7|1.000|1
+Verdigris|Azurite_c|3|0.800|1
+GlitchForge|Verdigris|2|0.340|1
+SLOT 2
+Psychedelic|MTH_C|6|0.500|1
+Verdigris|MTH|2|0.500|1
+Psychedelic|GlitchForge|2|0.500|1
+Azurite_c|GlitchForge|2|0.500|1
