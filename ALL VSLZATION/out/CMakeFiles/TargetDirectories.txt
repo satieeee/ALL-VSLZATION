@@ -1,0 +1,4 @@
+D:/C++ prog/ALL VSLZATION/out/CMakeFiles/BPMDetector.dir
+D:/C++ prog/ALL VSLZATION/out/CMakeFiles/MAIN.dir
+D:/C++ prog/ALL VSLZATION/out/CMakeFiles/edit_cache.dir
+D:/C++ prog/ALL VSLZATION/out/CMakeFiles/rebuild_cache.dir

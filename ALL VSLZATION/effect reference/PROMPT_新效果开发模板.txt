@@ -1,0 +1,309 @@
+请根据以下规范，创建新的程序化可视化效果 <EffectName>，与 Psychedelic 和 GlitchForge 具有相同的工程质量水平和架构。
+
+## 第零步：风格化数学函数参考（agent conclusion）
+
+生成新效果前，先检查 `effect reference/agent conclusion/` 文件夹。
+该文件夹存放其他 agent 总结的「风格化数学函数文件」——可复用的图案 / 变换 / 配色 / 缓动等数学函数。
+若该文件夹存在文件，优先阅读并复用其中的函数，避免重复造轮子；它们代表已验证的风格化视觉语言。
+若为空，则按本模板其余部分从零设计。
+
+## 第一步（备选）：应用根风格 + 随机种子生成效果（无参考图时）
+
+如果用户没有提供参考图，但提供了根风格文件（agent conclusion/root_style.json），
+则跳过下方「风格分析」，改用以下机制生成效果：
+
+1. 读取根风格文件，得到根种子（曲线族、矢量场、对称 N、臂数、螺旋增长率、配色、频率、纹理等）。
+2. 用一个随机种子（任意整数）对根种子做**受控扰动**，生成「根风格的变体」：
+   - 在根风格允许的范围内微调（如臂数 ±2、螺旋增长率 ±0.05、色相 ±15°、freqLow ±0.03…）
+   - 扰动幅度受「根风格变异范围」约束，保证不偏离根风格美学
+3. 每个不同的随机种子 → 一个不同的效果变体，但都共享根风格的曲线族/对称/配色基调。
+4. 把扰动后的种子交给 generator 渲染成线条/图案
+   （generator 契约见 GENERATOR_风格种子引擎设计.md，原型见 seed_generator_demo.html）。
+5. 变体效果仍需在 MAIN 或独立 exe 中肉眼验证（编译成功 ≠ 效果正确）。
+
+根风格 + 随机种子 = 「同一根美学、无限个细节变体」，无需为每个新效果重新分析图片。
+
+## 第一步：风格分析
+
+### 1.1 准备参考图（3~5 张，同风格）
+
+参考图存放：`D:\C++ prog\ALL VSLZATION\effect reference\a\`
+（用户手动将 3~5 张同风格参考图放入此目录）
+数量越多，汇总报告越能过滤单张偶然特征、保留多张共识特征。
+
+适合的图片类型：
+  · 程序化生成艺术 / 抽象绘画 / 数字艺术
+  · 材质纹理特写（大理石、液体、金属、烟雾）
+  · 平面设计 / 海报（单一风格）
+  · 万花筒 / 分形图案
+  · 故障艺术 / VHS 截图
+
+不适合的图片：
+  · 有人物/物体的照片（物体轮廓污染边缘统计）
+  · 风景照（区域特征矛盾，均值无意义）
+  · 纯色块极简设计（边缘太少，无梯度数据）
+  · JPEG 低质量压缩（压缩伪影引入虚假边缘）
+
+### 1.2 批量分析
+
+运行批量分析（通配符或逐个列出）：
+
+  cd "D:\C++ prog\ALL VSLZATION\effect reference"
+  ImageStyleAnalyzer.exe "a\ref1.png" "a\ref2.png" "a\ref3.png"
+
+或：
+
+  ImageStyleAnalyzer.exe "D:\C++ prog\ALL VSLZATION\effect reference\a\*.png"
+
+工具会先输出每张图的独立报告，最后输出一份 ★ BATCH SUMMARY 汇总平均报告。
+
+### 1.3 提交数据
+
+把以下内容一起给我：
+  - 汇总平均报告（最重要——这是多张图的统计共识）
+  - 如果某张图与汇总偏离明显，指出并忽略它
+  - 参考图本身（让我看到视觉风格）
+
+## 第二步：选择坐标系（user 必须明确指定）
+
+在开始设计效果参数之前，user 必须从以下两种坐标系中二选一：
+
+### 选项 A：极坐标万花筒（推荐，与 Verdigris/Psychedelic/GlitchForge 当前架构一致）
+
+视觉效果：中心起点的 10 楔形镜像对称，所有图案呈径向扩散或同心旋转。
+适合：各向同性参考图（边缘方向集中度 < 0.3）、对称纹理、分形/万花筒风格。
+
+架构特征：
+- LUT 预计算 `(r, theta)` 极坐标 + 万花筒折叠（`RebuildLUT` / `RebuildBuf` 中完成）
+- 形态函数签名 `EvalForm(Form, float r, float theta, float t, float speed, const PrecompData& pc)`
+- `r` 为径向距离 [0, ~1.4]，`theta` 为折叠后归一化角度 [0, 1]
+- 投影变换 `MapProjection` 操作极坐标 `(r, theta)`
+- 径向频率应极低（0.03~0.12），视觉结构靠角向变化驱动
+- 由于 `theta` 被 10 楔形折叠压缩到 [0, 1]，角频率参数需要放大才能达到与笛卡尔同等的视觉密度
+  · 形态函数内用 `a = theta * 2π` 还原弧度，角系数取 0.3~2.0（与 Psychedelic 一致）
+  · GlitchDisplace 类函数内角系数取 3~50（比笛卡尔低 3~4 倍，因为 `a` 跨度 6.28 rad/楔形）
+
+### 选项 B：笛卡尔平面
+
+视觉效果：线性扫描线、水平/垂直条带、网格块状结构，无万花筒对称。
+适合：方向性强的参考图（边缘方向集中度 > 0.3）、VHS 故障风格、扫描线/条纹风格。
+
+架构特征：
+- 无 LUT 或 LUT 仅存 `(xNorm, yNorm)` 笛卡尔坐标
+- 形态函数签名 `EvalForm(Form, float x, float y, float t, float speed, const PrecompData& pc)`
+- `x, y` 为归一化屏幕坐标 [−1, 1]
+- 无需 `MapProjection`（或仅做简单线性变换）
+- 空间频率直接匹配屏幕像素密度：`sinf(y * N)` 中 N=10~50 为常见范围
+- 方向性直接由 x/y 偏置体现：水平效果侧重 y，垂直效果侧重 x
+
+### 当前三个效果的模式
+
+| 效果 | 坐标系 |
+|------|--------|
+| Psychedelic | 极坐标万花筒（PROJ_RADIAL 默认） |
+| GlitchForge | 极坐标万花筒（4 形态全部极坐标原生） |
+| Verdigris   | 极坐标万花筒 |
+
+---
+
+## 第三步：根据报告设计效果参数
+
+根据报告的客观数据，确定以下参数。每一项决策必须有报告数据的依据：
+
+### 2.1 形态函数（至少 4 种，对应 Psychedelic::Form / GlitchForge::GlitchMode）
+
+- 空间频率范围：由边缘密度和纹理复杂度决定
+  · 边缘密度 > 0.3 且纹理复杂 → 高频为主（空间频率参数 > 1.0）
+  · 边缘密度 < 0.1 且纹理简单 → 低频为主（空间频率参数 0.1~0.5）
+  · 中等 → 混合频率
+- 方向性：由边缘主方向和方向集中度决定
+  · 方向集中度 > 0.5 → 形态函数体现该主导方向（如水平扫描线、垂直条纹）
+  · 方向集中度 < 0.3 → 形态函数全方向/旋转对称
+- 形态复杂度：由纹理复杂度决定
+  · 复杂度 > 0.6 → 4~6 层嵌套三角函数叠加
+  · 复杂度 < 0.2 → 1~2 层简单函数
+- 函数签名取决于第二步选择的坐标系：
+  · 选项 A（极坐标万花筒）：
+    float EvalForm(Form f, float r, float theta, float t, float speed, const PrecompData& pc) const;
+  · 选项 B（笛卡尔平面）：
+    float EvalForm(Form f, float x, float y, float t, float speed, const PrecompData& pc) const;
+
+### 2.2 配色方案（至少 4 种，对应 Psychedelic::ColorScheme）
+
+- 主色调：取报告的 dominantHue（最拥挤的色调桶中心值）
+- 饱和度范围：取 avgSat ± satSpread
+- 亮度范围：取 avgLight ± lightSpread
+- 配色多样性：paletteDiversity
+  · < 0.1 → 4 种方案围绕同一主色调做微变（色相偏移 < 15°）
+  · 0.1~0.3 → 6 种方案在主导色 ± 60° 范围内
+  · > 0.3 → 6 种方案覆盖全色相环
+- 白底过渡行为：参考报告的亮度直方图
+  · 亮调图片 → 淡区面积大（T0 阈值降低，如 0.15~0.20）
+  · 暗调图片 → 淡区面积小（T0 阈值升高，如 0.25~0.35）
+- 函数签名必须与 Psychedelic::MapColor 完全一致：
+    uint32_t MapColor(ColorScheme cs, float pattern, float r, float theta,
+                      const PrecompData& pc, float bpm, float phase) const;
+
+### 2.3 投影/坐标变换（至少 4 种，对应 Psychedelic::Projection）
+
+- 由边缘方向分布决定每种投影的空间映射逻辑
+- 由构图数据（brightCenterX/Y）决定是否需要偏置投影中心
+- 函数签名必须与当前 MapProjection 一致
+
+### 2.4 Beat 信号稳健性
+
+BPMDetector 用「快慢包络比值」检测鼓点，基线跟踪谷值（下降快、上升慢），持续响度下不会漏检。
+但效果消费 beatPhase / beatTriggered 时仍需注意：鼓点信号在持续响度段可能相对衰减，
+不要假设每一拍都有强 trigger；动画应能在 beat 信号缺失时仍保持流畅（回退到 BPM 相位推进）。
+
+## 第四步：实现规范
+
+### 3.1 目录结构
+
+生成的效果工程放在：`D:\C++ prog\ALL VSLZATION\VisualEffects\<EffectName>\`
+
+  VisualEffects/<EffectName>/
+  ├── <EffectName>.h          # 头文件
+  ├── <EffectName>.cpp        # 实现文件
+  └── main.cpp                # 独立 .exe 启动器
+
+### 3.2 必须实现的接口（继承 IProceduralEffect）
+
+  class <EffectName> : public IProceduralEffect {
+  public:
+      // ---- IVisualEffect ----
+      const wchar_t* GetName() const override;
+      int GetQuality() const override;
+      void Render(HDC hdc, const RECT& rect,
+                  const float* spectrum, int spectrumBins,
+                  const float* waveform, int waveformSize) override;
+
+      // ---- IProceduralEffect（跨效果数学过渡必需）----
+      void PrepareFrame(float dt, float bpm) override;
+      float EvalPattern(float xNorm, float yNorm) const override;
+      uint32_t MapToColor(float pattern, float xNorm, float yNorm,
+                          float beatPhase) const override;
+      const PrecompData& GetPrecomp() const override;
+
+      // ---- BPM/Beat 同步 ----
+      void SyncBeatState(float bpm, float phase, bool triggered) override;
+
+      // ---- 形态/配色/投影切换控制 ----
+      void NextForm();
+      void NextColorScheme();
+      void NextProjection();
+      const wchar_t* GetFormName() const;
+      const wchar_t* GetColorSchemeName() const;
+      const wchar_t* GetProjectionName() const;
+  };
+
+### 3.3 工程要求
+
+1. 多线程渲染：使用 std::thread，按 Psychedelic::RenderChunk 模式分块
+2. 预计算三角函数：使用共享的 PrecompData + BuildPrecompData()，每帧一次
+3. smoothstep 过渡：形态间切换使用 blend^2 × (3 - 2×blend) 缓入缓出
+4. 白底设计：浅色/空白区域平滑过渡到白色（参考 Psychedelic 的 T0 淡区逻辑）
+5. QUALITY 宏：至少支持半分辨率渲染（QUALITY=2）
+6. LUT 预计算：屏幕坐标查找表仅在窗口 resize 时重建
+7. 无外部依赖：仅使用 Windows GDI + 标准 C++17，不需要第三方库
+8. 注释风格：中文 Doxygen 格式，与 Psychedelic.cpp 一致
+9. 分辨率无关性：形态 / 配色 / 投影函数必须只用归一化坐标（[-1,1] 或 [0,1]），禁止硬编码像素尺寸。
+   CPU 渲染分辨率是动态自适应的（可能低于窗口分辨率，由 StretchDIBits 拉伸到窗口）；
+   GPU 渲染则是窗口多大渲染多大（1:1）。任何「假设固定分辨率」的写法都会在窗口缩放或动态降分辨率时错位。
+
+### 3.3.1 选项 A（极坐标万花筒）特有要求
+
+- `RenderChunk` 中必须从 LUT 初始化 `float r = pt.r, th = pt.theta;`，否则 PROJ_RADIAL 空操作会导致栈垃圾值
+- 形态函数使用 `a = theta * 2π` 将归一化角度还原为弧度
+- **径向频率必须极低（0.03~0.12）**，视觉结构靠角向变化驱动。径向频率 > 0.3 会产生密集同心圆环
+- GlitchDisplace 类函数中角系数取 3~50（与 BasePattern 的角系数 3~7 区分：位移函数的频率通常更高）
+- LUT 在 `RebuildLUT`/`RebuildBuf` 中完成万花筒折叠（10 楔形，交替镜像）
+
+### 3.3.2 选项 B（笛卡尔平面）特有要求
+
+- `RenderChunk` 中直接计算 `float px = ((sx+0.5f)*Q - cx)/mr, py = ...;`，无需极坐标转换
+- 形态函数直接用 `x, y` 作为空间坐标，`x, y ∈ [-1, 1]`
+- 空间频率匹配屏幕像素密度：`sinf(y * N)` 中 N=10~50
+- 方向性由 x/y 偏置体现：水平效果侧重 y，垂直效果侧重 x
+- 如需万花筒效果可后期加 `KaleidoFold(px, py)` 预处理，但会有额外 trig 开销
+
+### 3.4 性能要求
+
+- 每像素 trig 调用数 < 20（形态函数内部）
+- 过渡期间每像素 trig 调用数 < 40（两个形态同时评估）
+- 60fps 目标（16ms/帧），1080p 全分辨率
+
+## 第五步：集成到 MAIN.exe
+
+完成后修改以下文件：
+
+1. main.cpp：
+   - 添加 #include "VisualEffects/<EffectName>/<EffectName>.h"
+   - 在 RegisterEffects() 中添加 Register(L"<EffectName>", ...)
+
+2. CMakeLists.txt：
+   - 在 EFFECT_SOURCES 中添加 <EffectName>.cpp 和 <EffectName>.h
+   - 添加独立的 add_executable(<EffectName> WIN32 ...) 目标
+
+3. 重新编译 MAIN.exe 验证无错误
+
+## 第六步：已知 Bug 清单与排查指南
+
+以下是 Verdigris 开发过程中实际遇到的 bug，按出现顺序排列。
+所有参数层面看起来合理的设计，最终都要靠"重启 MAIN 肉眼验证"通过才算数。
+
+### Bug 1: GDI+ 初始化崩溃（ImageStyleAnalyzer）
+
+症状：分析第二张图时 segfault。
+原因：`GdiplusStartup`/`GdiplusShutdown` 写在 `LoadImage()` 内部，每张图各初始化/关闭一次 GDI+。
+修复：GDI+ 初始化移到 `wmain` 进程级，整个进程只调用一次，显式设置 `gdiSI.GdiplusVersion = 1`。
+
+### Bug 2: 局部对比度 NaN
+
+症状：纹理分析报告局部对比度显示 `-nan(ind)`。
+原因：`sqrtf(sumL2/wc - mean*mean)` —— 浮点精度导致括号内可能为极小负数。
+修复：`float var = sumL2/wc - mean*mean; if (var < 0) var = 0; float stddev = sqrtf(var);`
+
+### Bug 3: 报告输出乱码
+
+症状：bash 终端里 Unicode 框线字符和中文全部显示为 `?` 或乱码。
+原因：`wprintf(L"╔...")` 输出 UTF-16LE，bash 期望 UTF-8。
+修复：全部改用 `fprintf(stdout, ...)` + ASCII 框线字符 + 英文字段名。
+
+### Bug 4（关键）: 纯色块无图案 / 闪烁纯色
+
+症状：可视化窗口显示单一颜色，随时间闪烁变色，看不到任何线条或结构。
+原因：`RenderChunk` 中 `float r, th;` 未初始化，而 `MapProjection::PROJ_RADIAL` 是空 `break`。
+这导致 `r` 和 `th` 使用栈上的随机垃圾值。所有像素共用同一组随机值，算出同一个颜色。
+根本原因：重构 `MapProjection` 签名时，把原来的 `r=pt.r; theta=pt.theta;` 改成了空 `break`，
+但没有在调用侧补上 `float r = pt.r, th = pt.theta;` 初始化。
+修复：`float r = pt.r, th = pt.theta;` 先赋 LUT 预计算值，再传给 MapProjection（投影可能覆盖它们）。
+同样的 bug 也存在于 Psychedelic，创建新效果时务必检查 `RenderChunk` 中的这段初始化。
+
+### Bug 5: 图案可见但近乎纯白
+
+症状：bug 4 修完后能看到图案但极淡，大部分区域是白色。
+原因：三层叠加导致：
+  a) 形态除数太大（2.0~2.5），pattern 振幅被压到 0.1~0.4 区间；
+  b) T0=0.28 白底阈值偏高，大部分 |pattern| 落在白底淡区；
+  c) 饱和度 0.06~0.28 过于贴近灰色，即使有色也肉眼难辨。
+修复：
+  a) 除数降到 1.25~1.55，pattern 振幅翻倍；
+  b) T0 降到 0.22；
+  c) 饱和度提到 0.12~0.45（依然是低饱和，但有色感）。
+
+### Bug 6: 图案飘动太慢
+
+症状：形态动画几乎静止。
+原因：形态函数中 `t * N * speed` 的时间系数 N 在 0.2~0.5，BPM=120 时每帧相位增量极小。
+修复：时间系数提到 0.4~0.9。
+
+### 调试铁律
+
+1. **数据只能定参数方向，不能定绝对值。** 图片分析给出的是色彩/边缘/纹理的统计特征，
+   但程序化可视化的饱和度和亮度需要比原图高 2~3 倍才能在人眼中形成可辨识的色差。
+2. **先让 Pschedelic 跑通再抄架构。** 新效果出现诡异行为时，对比 Psychedelic 的同名函数，
+   差异之处极可能就是 bug 所在。
+3. **RenderChunk 里的 `r, th` 初始化是每次创建新效果最容易踩的坑。**
+   只要 MapProjection 有任何一个 case 是空操作，`r, th` 就必须从 LUT 赋值。
+4. **编译成功 ≠ 效果正确。** 每次改动后必须在 MAIN 或独立 exe 中肉眼确认图案可见、色彩可辨、动画流畅。
