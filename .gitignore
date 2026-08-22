@@ -1,6 +1,8 @@
 # 构建产物
-out/
+out/*
+!out/MAIN.exe
 *.exe
+!out/MAIN.exe
 *.dll
 *.lib
 *.obj
