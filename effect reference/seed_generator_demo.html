@@ -1,0 +1,321 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>风格种子 Generator 原型</title>
+<style>
+  html,body{margin:0;height:100%;background:#111;color:#ddd;font:13px/1.5 system-ui,sans-serif;}
+  #wrap{display:flex;height:100vh;}
+  canvas{flex:1;height:100%;display:block;}
+  #ui{width:330px;padding:14px;overflow-y:auto;background:#16181c;border-left:1px solid #2a2d33;box-sizing:border-box;}
+  #ui h2{margin:0 0 6px;font-size:15px;color:#fff;}
+  #ui .grp{margin:12px 0;padding:8px;background:#1d2026;border-radius:6px;}
+  #ui .grp h3{margin:0 0 6px;font-size:12px;color:#8ab;text-transform:uppercase;letter-spacing:.5px;}
+  label{display:flex;justify-content:space-between;align-items:center;margin:3px 0;font-size:12px;}
+  label span{min-width:96px;color:#9aa;}
+  label b{color:#eee;font-variant-numeric:tabular-nums;min-width:40px;text-align:right;}
+  input[type=range]{width:120px;}
+  select{background:#2a2d33;color:#eee;border:1px solid #3a3d44;border-radius:4px;width:100%;}
+  .seed-json{width:100%;height:150px;background:#0d0f12;color:#8f8;border:1px solid #2a2d33;border-radius:4px;font:11px/1.4 monospace;padding:6px;box-sizing:border-box;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="c"></canvas>
+  <div id="ui">
+    <h2>风格种子 Generator</h2>
+    <p style="color:#788;font-size:11px;margin:0 0 8px;">同一批图 → 同一种子 → 确定性线条。<br>支持极坐标(polar) 与 笛卡尔(cartesian)。</p>
+    <div id="controls"></div>
+    <div class="grp">
+      <h3>当前种子 JSON（可复制）</h3>
+      <textarea id="json" class="seed-json"></textarea>
+    </div>
+  </div>
+</div>
+
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 p;
+void main(){ gl_Position = vec4(p,0.0,1.0); }
+</script>
+
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+uniform vec2 uRes;
+uniform float uTime;
+uniform int uCoordSystem;   // 0 polar, 1 cartesian
+uniform int uCurveFamily;   // 0 spiral,1 rose,2 radial,3 archimedean
+uniform int uFieldType;     // 0 source,1 sink,2 vortex,3 saddle,4 uniform
+uniform int uLineType;      // 0 stripe,1 grid,2 checker,3 scanline
+uniform float uSymmetryFold;
+uniform float uMirror;
+uniform float uArmCount;
+uniform float uSpiralGrowth;
+uniform float uTwist;
+uniform float uCurvature;
+uniform float uLineAngle;
+uniform float uSpacing;
+uniform float uXWeight;
+uniform float uYWeight;
+uniform float uOffsetX;
+uniform float uOffsetY;
+uniform float uRotation;
+uniform float uFreqLow;
+uniform float uFreqHigh;
+uniform float uComplexity;
+uniform float uThickness;
+uniform float uSharpness;
+uniform float uHue;
+uniform vec2 uSatRange;
+uniform vec2 uLightRange;
+uniform float uDarkBg;
+uniform float uBeta;
+uniform float uFractalDim;
+uniform int uNoiseType;     // 0 none,1 value,2 fbm
+uniform float uNoiseSeed;
+#define TAU 6.28318530718
+#define PI 3.14159265359
+
+float hash21(vec2 p){ p=fract(p*vec2(123.34,456.21)); p+=dot(p,p+45.32); return fract(p.x*p.y); }
+float vnoise(vec2 p){ vec2 i=floor(p),f=fract(p); f=f*f*(3.0-2.0*f);
+  return mix(mix(hash21(i),hash21(i+vec2(1.,0.)),f.x),mix(hash21(i+vec2(0.,1.)),hash21(i+vec2(1.,1.)),f.x),f.y); }
+float fbm(vec2 p){ float v=0.,a=.5; for(int i=0;i<8;i++){ v+=a*vnoise(p); p*=2.03; a*=.5; } return v; }
+
+vec3 hsl2rgb(float h,float s,float l){ h=mod(h,360.); if(h<0.)h+=360.;
+  float c=(1.-abs(2.*l-1.))*s, hp=h/60., x=c*(1.-abs(mod(hp,2.)-1.));
+  vec3 rgb;
+  if(hp<1.)rgb=vec3(c,x,0.); else if(hp<2.)rgb=vec3(x,c,0.);
+  else if(hp<3.)rgb=vec3(0.,c,x); else if(hp<4.)rgb=vec3(0.,x,c);
+  else if(hp<5.)rgb=vec3(x,0.,c); else rgb=vec3(c,0.,x);
+  return rgb+(l-c*.5); }
+
+void main(){
+  vec2 uv=(gl_FragCoord.xy-0.5*uRes)/min(uRes.x,uRes.y);
+  vec2 p = uv - vec2(uOffsetX, uOffsetY);
+
+  float r=length(p);
+  float theta=atan(p.y,p.x)/TAU+0.5;
+  float v1=0.0, v2=0.0;
+
+  if(uCoordSystem==0){
+    // ---- 极坐标：主螺旋 + 反向螺旋（交错）----
+    float N=max(uSymmetryFold,1.0);
+    float a=theta*TAU;
+    float wedge=TAU/N;
+    a=mod(a,wedge);
+    if(uMirror>0.5){ if(a>wedge*0.5) a=wedge-a; }
+    float th=a/wedge;
+
+    float rr=r;
+    if(uFieldType==0){ rr=r*(1.0+uTwist*0.3); }          // 源：径向外扩
+    else if(uFieldType==1){ rr=r*(1.0-uTwist*0.3); }     // 汇：径向内缩
+    else if(uFieldType==2){ th=th+uTwist*r*0.3; rr=r; }  // 漩涡：切向旋转
+    else if(uFieldType==3){ rr=p.x*p.y; }                 // 鞍点：双曲
+    // uniform：rr=r（默认，不变）
+
+    if(uCurveFamily==0)      v1=sin(uArmCount*th*TAU + log(max(rr,0.01))*uSpiralGrowth*30.0);
+    else if(uCurveFamily==3) v1=sin(uArmCount*th*TAU + rr*uSpiralGrowth*30.0);
+    else if(uCurveFamily==1) v1=cos(uArmCount*th*TAU)*(1.0-0.5*rr);
+    else                     v1=sin(uArmCount*th*TAU);
+    v2=sin(-uArmCount*th*TAU + log(max(rr,0.01))*uSpiralGrowth*30.0);
+  } else {
+    // ---- 笛卡尔：强制非对称（禁止中心对称 + 轴对称）----
+    // 偏移 + 旋转 + 剪切（破坏中心/轴对齐）
+    float aRad=(uRotation+30.0)*PI/180.0;
+    float ca=cos(aRad), sa=sin(aRad);
+    float wx=p.x + uOffsetX + 0.30;
+    float wy=p.y + uOffsetY - 0.20;
+    float tx=wx*ca - wy*sa + 0.4*wy;   // 旋转 + 剪切
+    float ty=wx*sa + wy*ca;
+    // fieldType 坐标扭曲（笛卡尔映射）
+    if(uFieldType==0){ tx*=(1.0+uTwist*0.3); ty*=(1.0+uTwist*0.3); }   // 源：外扩
+    else if(uFieldType==1){ tx*=(1.0-uTwist*0.3); ty*=(1.0-uTwist*0.3); } // 汇：内缩
+    else if(uFieldType==2){ tx+=uTwist*sin(ty*uFreqLow*4.0); ty+=uTwist*sin(tx*uFreqHigh*4.0); } // 漩涡：卷曲
+    else if(uFieldType==3){ tx=tx*ty; }                                  // 鞍点：双曲
+    // 非对称域扭曲
+    tx += uTwist*sin(ty*uFreqLow*8.0 + 1.3);
+    ty += uTwist*cos(tx*uFreqHigh*7.0 - 0.7);
+    // 非对称形状：奇次幂/交叉项/线性项 → 数学上无中心/轴对称
+    float shape;
+    if(uCurveFamily==4){          // 非对称椭圆（交叉项 xy + 线性项）
+        shape = tx*tx + 0.6*ty*ty + 0.4*tx*ty + 0.25*tx - 0.15*ty - 0.20;
+    } else if(uCurveFamily==5){   // 非对称三次曲线
+        shape = tx*tx*tx + 0.8*ty*ty*ty + 0.5*tx*ty + 0.3*tx - 0.18;
+    } else if(uCurveFamily==6){   // 偏心形线（cardioid + 偏移项）
+        float r2 = tx*tx + ty*ty;
+        shape = r2*r2 - 0.5*tx*r2 - 0.06*ty*ty + 0.06*tx;
+    } else {                      // 非对称星形（奇次幂 sign·|x|^n）
+        float sx = sign(tx)*pow(abs(tx),0.6);
+        float sy = sign(ty)*pow(abs(ty),0.6);
+        shape = sx + sy - 0.35 + 0.1*tx;
+    }
+    v1 = shape;
+    v2 = 100.0;
+  }
+
+  // 多频细节（complexity / curvature）
+  int L=int(uComplexity);
+  for(int i=0;i<6;i++){ if(i>=L) break;
+    float f=mix(uFreqLow,uFreqHigh,float(i)/max(float(L-1),1.0));
+    v1+=sin(f*r*25.0+float(i)*1.7+uTime*uCurvature)*0.45/float(i+1); }
+
+  // 噪声（beta / fractalDim / noiseSeed）
+  if(uNoiseType>0){ vec2 np=uv*(uBeta*4.0+1.0)+uNoiseSeed;
+    float n=(uNoiseType==2)?fbm(np):vnoise(np); v1+=(n-0.5)*uFractalDim; }
+
+  // ---- 伪 3D 管状渲染：两族线交叉 + 线心高光（管状体积感）----
+  float d1=abs(v1), d2=abs(v2);
+  float line1=smoothstep(uThickness+uSharpness*0.1, uThickness-uSharpness*0.1, d1);
+  float line2=smoothstep(uThickness+uSharpness*0.1, uThickness-uSharpness*0.1, d2);
+
+  // 线心高光：圆柱中心亮、边缘暗（无需导数，兼容所有浏览器）
+  float core1=1.0-smoothstep(0.0,uThickness,d1);
+  float core2=1.0-smoothstep(0.0,uThickness,d2);
+
+  float tube1=0.25+0.75*core1;
+  float tube2=0.25+0.75*core2;
+  float shade=clamp(line1*tube1 + line2*tube2, 0.0, 1.0);
+
+  // 配色
+  float hue=uHue+v1*30.0;
+  float sat=mix(uSatRange.x,uSatRange.y,fract(v1*2.7));
+  float lig=mix(uLightRange.x,uLightRange.y,0.5+0.5*sin(v1*4.0));
+  vec3 col=hsl2rgb(hue,sat,lig);
+  vec3 bg=(uDarkBg>0.5)?vec3(0.02):vec3(0.97);
+
+  gl_FragColor=vec4(mix(bg,col,shade),1.0);
+}
+</script>
+
+<script>
+// 本实验默认种子 = Gemini 输出的 y2k_liquid_chrome_polar（agent conclusion/gemini-code-1786894357804.json）
+const seed = {
+  name: "y2k_liquid_chrome_polar",
+  coordSystem: 0,        // 0 polar
+  offsetX: -0.05, offsetY: 0.05, rotation: 0,
+  curveFamily: 0,        // 0 spiral
+  fieldType: 2,          // 2 vortex
+  symmetryFold: 8, mirror: 0, armCount: 8, spiralGrowth: 0.22, twist: 0.75, curvature: 0.45,
+  freqLow: 0.05, freqHigh: 3.20, complexity: 5, thickness: 0.25, sharpness: 0.85,
+  hue: 210, satRange: [0.10, 0.85], lightRange: [0.05, 0.95],
+  beta: 1.95, fractalDim: 1.72, noiseType: 2, noiseSeed: 8842109
+};
+
+const enumOpts = {
+  coordSystem: [["极坐标 polar",0],["笛卡尔 cartesian",1]],
+  curveFamily: [["螺旋 spiral",0],["玫瑰 rose",1],["径向 radial",2],["阿基米德 archimedean",3],["非对称椭圆 ellipse",4],["非对称三次 cubic",5],["偏心形线 cardioid",6],["非对称星形 star",7]],
+  fieldType: [["源 source",0],["汇 sink",1],["漩涡 vortex",2],["鞍点 saddle",3],["均匀流 uniform",4]],
+  noiseType: [["无 none",0],["value",1],["fbm",2]]
+};
+
+const numFields = [
+  ["offsetX","偏移 X",-1,1,0.01],
+  ["offsetY","偏移 Y",-1,1,0.01],
+  ["rotation","旋转角°",0,360,1],
+  ["symmetryFold","对称 N",1,16,1],
+  ["armCount","臂数",2,20,1],
+  ["spiralGrowth","螺旋增长率 b",0,0.8,0.01],
+  ["twist","螺旋度",0,1,0.01],
+  ["curvature","曲率",0,1,0.01],
+  ["freqLow","低频",0.02,0.4,0.01],
+  ["freqHigh","高频",0.5,5,0.1],
+  ["complexity","嵌套层数",1,6,1],
+  ["thickness","线宽",0.02,0.5,0.01],
+  ["sharpness","锐度",0.05,0.6,0.01],
+  ["hue","主色相",0,360,1],
+  ["beta","幂律 β",0,3,0.01],
+  ["fractalDim","分形维数 D",0,2.5,0.01],
+  ["noiseSeed","噪声种子",0,10000,1]
+];
+const boolFields = [["mirror","镜像对称"]];
+
+// 背景色 = 运行时控制（对应 MAIN 的 BG 键），不属于种子
+let bgDark = 0;
+
+const ui = document.getElementById('controls');
+function addGroup(title){ const d=document.createElement('div'); d.className='grp';
+  const h=document.createElement('h3'); h.textContent=title; d.appendChild(h); ui.appendChild(d); return d; }
+
+function addEnum(key){ const g=addGroup(key);
+  const s=document.createElement('select');
+  enumOpts[key].forEach(([lbl,val])=>{ const o=document.createElement('option'); o.textContent=lbl; o.value=val; if(seed[key]===val)o.selected=true; s.appendChild(o); });
+  s.onchange=()=>{ seed[key]=parseInt(s.value); upload(); syncJson(); };
+  g.appendChild(s); }
+
+function addRange(key,label,min,max,step){ const g=addGroup(label);
+  const r=document.createElement('input'); r.type='range'; r.min=min; r.max=max; r.step=step; r.value=seed[key];
+  const b=document.createElement('b'); b.textContent=seed[key];
+  r.oninput=()=>{ seed[key]=parseFloat(r.value); b.textContent=+r.value; upload(); syncJson(); };
+  g.appendChild(r); g.appendChild(b); }
+
+function addBool(key,label){ const g=addGroup(label);
+  const c=document.createElement('input'); c.type='checkbox'; c.checked=!!seed[key];
+  c.onchange=()=>{ seed[key]=c.checked?1:0; upload(); syncJson(); };
+  g.appendChild(c); }
+
+addEnum('coordSystem'); addEnum('curveFamily'); addEnum('fieldType'); addEnum('noiseType');
+numFields.forEach(f=>addRange(...f));
+boolFields.forEach(f=>addBool(...f));
+(function(){ const g=addGroup('背景色（BG 键，运行时）');
+  const c=document.createElement('input'); c.type='checkbox'; c.checked=false;
+  c.onchange=()=>{ bgDark=c.checked?1:0; upload(); };
+  g.appendChild(c); })();
+
+const jt=document.getElementById('json');
+function syncJson(){ const o={...seed}; jt.value=JSON.stringify(o,null,2); }
+
+// WebGL
+const canvas=document.getElementById('c');
+const gl=canvas.getContext('webgl',{preserveDrawingBuffer:true});
+function compile(type,src){ const s=gl.createShader(type); gl.shaderSource(s,src); gl.compileShader(s);
+  if(!gl.getShaderParameter(s,gl.COMPILE_STATUS)){ console.error(gl.getShaderInfoLog(s)); } return s; }
+const prog=gl.createProgram();
+gl.attachShader(prog,compile(gl.VERTEX_SHADER,document.getElementById('vs').textContent));
+gl.attachShader(prog,compile(gl.FRAGMENT_SHADER,document.getElementById('fs').textContent));
+gl.linkProgram(prog); gl.useProgram(prog);
+const buf=gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buf);
+gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,-1,1,1,1]),gl.STATIC_DRAW);
+const loc=gl.getAttribLocation(prog,'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc,2,gl.FLOAT,false,0,0);
+
+const U={}; ['uRes','uTime','uCoordSystem','uCurveFamily','uFieldType','uLineType','uSymmetryFold','uMirror',
+'uArmCount','uSpiralGrowth','uTwist','uCurvature','uLineAngle','uSpacing','uXWeight','uYWeight','uOffsetX','uOffsetY',
+'uRotation','uFreqLow','uFreqHigh','uComplexity','uThickness','uSharpness','uHue','uSatRange','uLightRange','uDarkBg',
+'uBeta','uFractalDim','uNoiseType','uNoiseSeed'].forEach(n=>U[n]=gl.getUniformLocation(prog,n));
+
+function upload(){
+  gl.uniform2f(U.uRes,canvas.width,canvas.height);
+  gl.uniform1i(U.uCoordSystem,seed.coordSystem);
+  gl.uniform1i(U.uCurveFamily,seed.curveFamily);
+  gl.uniform1i(U.uFieldType,seed.fieldType);
+  gl.uniform1i(U.uNoiseType,seed.noiseType);
+  gl.uniform1f(U.uSymmetryFold,seed.symmetryFold);
+  gl.uniform1f(U.uMirror,seed.mirror);
+  gl.uniform1f(U.uArmCount,seed.armCount);
+  gl.uniform1f(U.uSpiralGrowth,seed.spiralGrowth);
+  gl.uniform1f(U.uTwist,seed.twist);
+  gl.uniform1f(U.uCurvature,seed.curvature);
+  gl.uniform1f(U.uOffsetX,seed.offsetX);
+  gl.uniform1f(U.uOffsetY,seed.offsetY);
+  gl.uniform1f(U.uRotation,seed.rotation);
+  gl.uniform1f(U.uFreqLow,seed.freqLow);
+  gl.uniform1f(U.uFreqHigh,seed.freqHigh);
+  gl.uniform1f(U.uComplexity,seed.complexity);
+  gl.uniform1f(U.uThickness,seed.thickness);
+  gl.uniform1f(U.uSharpness,seed.sharpness);
+  gl.uniform1f(U.uHue,seed.hue);
+  gl.uniform2f(U.uSatRange,seed.satRange[0],seed.satRange[1]);
+  gl.uniform2f(U.uLightRange,seed.lightRange[0],seed.lightRange[1]);
+  gl.uniform1f(U.uDarkBg,bgDark);
+  gl.uniform1f(U.uBeta,seed.beta);
+  gl.uniform1f(U.uFractalDim,seed.fractalDim);
+  gl.uniform1f(U.uNoiseSeed,seed.noiseSeed);
+}
+
+function resize(){ canvas.width=canvas.clientWidth*devicePixelRatio; canvas.height=canvas.clientHeight*devicePixelRatio; gl.viewport(0,0,canvas.width,canvas.height); }
+window.addEventListener('resize',resize); resize();
+
+let t0=performance.now();
+function loop(){ const t=(performance.now()-t0)/1000; gl.uniform1f(U.uTime,t); upload(); gl.drawArrays(gl.TRIANGLE_STRIP,0,4); requestAnimationFrame(loop); }
+syncJson(); loop();
+</script>
+</body>
+</html>
