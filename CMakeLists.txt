@@ -28,7 +28,7 @@ target_include_directories(BPMDetector PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(BPMDetector PUBLIC ole32 uuid)
 
 add_executable(MAIN WIN32 main.cpp ${AUDIO_SOURCES} ${AUDIO_HEADERS} ${GPU_EFFECT_SOURCES})
-target_link_libraries(MAIN BPMDetector ole32 uuid gdi32 user32 comctl32 opengl32)
+target_link_libraries(MAIN BPMDetector ole32 uuid gdi32 gdiplus user32 comctl32 opengl32)
 target_include_directories(MAIN PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/VisualEffects)
 target_compile_definitions(MAIN PRIVATE _CRT_SECURE_NO_WARNINGS)
 set_target_properties(MAIN PROPERTIES OUTPUT_NAME "MAIN")

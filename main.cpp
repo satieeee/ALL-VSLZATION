@@ -17,6 +17,21 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <commctrl.h>
+// GDI+ 头文件的两个老坑：
+//   ① WIN32_LEAN_AND_MEAN 把 objidl.h 排除了，而 GDI+ 需要 PROPID 等类型 → 手动补
+//   ② 本项目定义了 NOMINMAX，而 GdiplusTypes.h 内部用了 min/max 宏 → 临时补上再撤掉
+#include <objidl.h>
+#ifndef max
+#define max(a,b) (((a) > (b)) ? (a) : (b))
+#define min(a,b) (((a) < (b)) ? (a) : (b))
+#define UI_TEMP_MINMAX 1
+#endif
+#include <gdiplus.h>          // 自绘 UI：圆角/抗锯齿/文字（系统自带，不算第三方依赖）
+#ifdef UI_TEMP_MINMAX
+#undef min
+#undef max
+#undef UI_TEMP_MINMAX
+#endif
 #include <gl/GL.h>
 #include <vector>
 #include <string>
@@ -4072,18 +4087,25 @@ static int g_silentFrames = 0;
 static void SetBPM(float bpm) { g_bpm = bpm; }
 static void SetSpeed(float s) { g_userSpeed = s; }
 
+// ===== 自绘 UI 的状态（替代原来的 TreeView / ListBox / 状态栏 STATIC）=====
+static int          g_uiSelEffect = -1;   // 画廊里选中的效果下标
+static int          g_uiSelPl     = -1;   // 播放链里选中的项
+static int          g_uiFilter    = 0;    // 家族筛选：0=全部，1..FAM_COUNT = 对应家族
+static float        g_uiScroll    = 0;    // 画廊滚动（像素）
+static int          g_uiDurSec    = 30;   // 新加入播放链的时长
+static std::wstring g_uiStatus    = L"正在加载 OpenGL shader...";
+// 播放链滚动：第一行显示哪一项 / dock 里同时能看到几行
+static int          g_uiScrollPl  = 0;
+static const int    kPlRows       = 3;
+
+static void UiStatus(const wchar_t* s) {
+    g_uiStatus = s;
+    if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
 static void RefreshPlaylistUI() {
-    ListBox_ResetContent(g_hPlaylist);
-    const wchar_t* bmNames[] = {L"无",L"变亮",L"滤色",L"叠加",L"强光",L"柔光",L"线性加深",L"正片叠底"};
-    for (size_t i = 0; i < g_playlist.size(); ++i) {
-        wchar_t s[300]; auto& it = g_playlist[i];
-        if (!it.name2.empty())
-            _snwprintf(s, 300, L"%d. %s + %s  [%s|%.0f%%]  [%ds]",
-                (int)i+1, it.name.c_str(), it.name2.c_str(),
-                bmNames[it.blendMode], it.opacity*100.0f, it.durationSec);
-        else _snwprintf(s, 300, L"%d. %s  [%ds]", (int)i+1, it.name.c_str(), it.durationSec);
-        ListBox_AddString(g_hPlaylist, s);
-    }
+    // 自绘 UI：播放链直接读 g_playlist 画，这里只需要触发重绘
+    if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
 // ===== 可用效果 TreeView（分类 + 可用性圆点）=====
@@ -4120,61 +4142,52 @@ static const wchar_t* kFamilyTitle[FAM_COUNT] = {
 // 重建效果树：每家族一棵根，CPU 模式只保留 CPU 可用效果。
 // 家族在 g_effects[i].family 上声明式分类——新家族（如 FAM_CUBE）加枚举 + 一行即可。
 static void RebuildEffectTree() {
-    if (!g_hList) return;
-    SendMessageW(g_hList, TVM_DELETEITEM, 0, (LPARAM)TVI_ROOT);
-    HTREEITEM rootItem[FAM_COUNT];
-    int cnt[FAM_COUNT] = {};
-    for (int f = 0; f < FAM_COUNT; ++f) rootItem[f] = AddTreeItem(nullptr, kFamilyTitle[f], -1);
-    for (int i = 0; i < g_effectCount; ++i) {
-        int fam = EffFamily(i);
-        AddTreeItem(rootItem[fam], g_effects[i].name, i);
-        ++cnt[fam];
-    }
-    // 分类名带计数
-    TVITEMW t = {}; t.mask = TVIF_TEXT;
-    wchar_t sn[64];
-    for (int f = 0; f < FAM_COUNT; ++f) {
-        _snwprintf(sn, 64, L"%s (%d)", kFamilyTitle[f], cnt[f]); t.hItem = rootItem[f]; t.pszText = sn;
-        SendMessageW(g_hList, TVM_SETITEMW, 0, (LPARAM)&t);
-        SendMessageW(g_hList, TVM_EXPAND, TVE_EXPAND, (LPARAM)rootItem[f]);
-    }
+    // 自绘 UI：画廊直接从 g_effects 生成，不需要建树
+    if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
-// 当前选中的叶子效果下标（根/无选中返回 -1）
 static int SelectedEffectIndex() {
-    HTREEITEM hSel = (HTREEITEM)SendMessageW(g_hList, TVM_GETNEXTITEM, TVGN_CARET, 0);
-    if (!hSel) return -1;
-    TVITEMW t = {}; t.mask = TVIF_PARAM; t.hItem = hSel;
-    SendMessageW(g_hList, TVM_GETITEMW, 0, (LPARAM)&t);
-    int idx = (int)t.lParam;
-    return (idx >= 0 && idx < g_effectCount) ? idx : -1;
+    return (g_uiSelEffect >= 0 && g_uiSelEffect < g_effectCount) ? g_uiSelEffect : -1;
 }
 
 static void PlaylistAdd() {
     int sel = SelectedEffectIndex();
-    if (sel < 0) { SetWindowTextW(g_hStatus, L"  请先选择左侧一个具体效果"); return; }
-    wchar_t buf[16]; GetWindowTextW(g_hEditDur, buf, 16);
-    int dur = _wtoi(buf); if (dur < 1) dur = 1;
-    PlaylistItem it; it.name = g_effects[sel].name; it.durationSec = dur;
+    if (sel < 0) { UiStatus(L"请先在左侧选一个效果"); return; }
+    PlaylistItem it; it.name = g_effects[sel].name; it.durationSec = g_uiDurSec;
     g_playlist.push_back(it);
+    g_uiSelPl = (int)g_playlist.size() - 1;
+    g_uiScrollPl = g_uiSelPl - kPlRows + 1;      // 新加的那项滚进视野
+    if (g_uiScrollPl < 0) g_uiScrollPl = 0;
     RefreshPlaylistUI();
-    ListBox_SetCurSel(g_hPlaylist, (int)g_playlist.size()-1);
+    UiStatus((L"已加入播放链：" + g_effects[sel].name).c_str());
 }
 
 static void PlaylistRemove() {
-    int sel = (int)SendMessageW(g_hPlaylist, LB_GETCURSEL, 0, 0);
+    int sel = g_uiSelPl;
     if (sel < 0 || sel >= (int)g_playlist.size()) return;
     g_playlist.erase(g_playlist.begin() + sel);
+    if (g_uiSelPl >= (int)g_playlist.size()) g_uiSelPl = (int)g_playlist.size() - 1;
     RefreshPlaylistUI();
 }
 
 static void PlaylistMoveUp() {
-    int sel = (int)SendMessageW(g_hPlaylist, LB_GETCURSEL, 0, 0);
-    if (sel > 0 && sel < (int)g_playlist.size()) { std::swap(g_playlist[sel], g_playlist[sel-1]); RefreshPlaylistUI(); ListBox_SetCurSel(g_hPlaylist, sel-1); }
+    int sel = g_uiSelPl;
+    if (sel > 0 && sel < (int)g_playlist.size()) {
+        std::swap(g_playlist[sel], g_playlist[sel-1]);
+        g_uiSelPl = sel - 1;
+        if (g_uiSelPl < g_uiScrollPl) g_uiScrollPl = g_uiSelPl;
+        RefreshPlaylistUI();
+    }
 }
+
 static void PlaylistMoveDown() {
-    int sel = (int)SendMessageW(g_hPlaylist, LB_GETCURSEL, 0, 0);
-    if (sel >= 0 && sel < (int)g_playlist.size()-1) { std::swap(g_playlist[sel], g_playlist[sel+1]); RefreshPlaylistUI(); ListBox_SetCurSel(g_hPlaylist, sel+1); }
+    int sel = g_uiSelPl;
+    if (sel >= 0 && sel < (int)g_playlist.size()-1) {
+        std::swap(g_playlist[sel], g_playlist[sel+1]);
+        g_uiSelPl = sel + 1;
+        if (g_uiSelPl >= g_uiScrollPl + kPlRows) g_uiScrollPl = g_uiSelPl - kPlRows + 1;
+        RefreshPlaylistUI();
+    }
 }
 
 static void PlaylistStart() {
@@ -4235,7 +4248,7 @@ static void ClearPlaylist() {
     PlaylistStop();
     g_playlist.clear();
     RefreshPlaylistUI();
-    if (g_hStatus) SetWindowTextW(g_hStatus, L"  已清空播放链");
+    UiStatus(L"已清空播放链");
 }
 
 static void DrawClearRing(HDC hdc, POINT c) {
@@ -4314,10 +4327,10 @@ static void PresetsLoadFromFile() {
         if (it.name == L"Cubeeffect3") it.name = L"Cubeeffect3 (dark)";tok=wcstok(nullptr,L"|\n",&ctx);if(tok)it.name2=tok;tok=wcstok(nullptr,L"|\n",&ctx);if(tok)it.blendMode=(BlendMode)_wtoi(tok);tok=wcstok(nullptr,L"|\n",&ctx);if(tok)it.opacity=(float)_wtof(tok);tok=wcstok(nullptr,L"|\n",&ctx);if(tok)it.durationSec=_wtoi(tok);if(!it.name.empty()&&it.durationSec>0)g_presets[cs].push_back(it);}}
     fclose(f);
 }
-static void PresetSave(int s) { g_presets[s]=g_playlist; PresetsSaveToFile(); wchar_t st[64];_snwprintf(st,64,L"  已存入预设%d（%d项）",s+1,(int)g_presets[s].size());SetWindowTextW(g_hStatus,st); }
-static void PresetLoad(int s) { if(g_presets[s].empty()){SetWindowTextW(g_hStatus,L"  预设为空");return;}for(auto&it:g_presets[s])g_playlist.push_back(it);RefreshPlaylistUI();wchar_t st[64];_snwprintf(st,64,L"  已追加预设%d",s+1);SetWindowTextW(g_hStatus,st); }
+static void PresetSave(int s) { g_presets[s]=g_playlist; PresetsSaveToFile(); wchar_t st[64];_snwprintf(st,64,L"  已存入预设%d（%d项）",s+1,(int)g_presets[s].size());UiStatus(st); }
+static void PresetLoad(int s) { if(g_presets[s].empty()){UiStatus(L"预设为空");return;}for(auto&it:g_presets[s])g_playlist.push_back(it);RefreshPlaylistUI();wchar_t st[64];_snwprintf(st,64,L"  已追加预设%d",s+1);UiStatus(st); }
 static void PresetDelete(int s) { g_presets[s].clear(); PresetsSaveToFile(); }
-static void UpdatePresetButtons() { for(int i=0;i<5;++i){int n=(int)g_presets[i].size();wchar_t lbl[32];_snwprintf(lbl,32,L"%d%s",i+1,n>0?L" ✓":L" -");HWND btn=GetDlgItem(g_hwnd,IDC_PRESET_BASE+i);if(btn)SetWindowTextW(btn,lbl);} }
+static void UpdatePresetButtons() { if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE); }
 
 // ===== Cubeeffect1 form1「粘滴/染墨」CPU 模拟（不播 Cubeeffect1 或停在 form0 时清空）=====
 // 可复现随机数（简单 hash）
@@ -4628,100 +4641,636 @@ static void UpdateBeat() {
     if (g_playerMode) PLUpdate(dt, g_bpm, af.beatPhase, hit);
 }
 
+// ============================================================================
+// 自绘 UI（GDI+）—— 效果画廊 + 播放链 dock
+//
+// 为什么全部自绘：原生 Win32 控件是系统 3D 外观，做不出平面设计（圆角卡片、
+// 悬停态、图形化按钮）。GDI+ 是 Windows 自带的（gdiplus.dll），不算第三方依赖。
+//
+// 结构：UiBuild() 算一次几何 → UiPaint() 画 → UiHitTest/UiClick() 处理输入。
+// 几何共用同一份，所以"看到的位置"和"点到的位置"永远一致。
+// ============================================================================
+namespace UIX {
+const Gdiplus::Color BG(255,15,17,21), PANEL(255,22,26,33), CARD(255,28,33,42),
+    CARD2(255,34,40,51), LN(255,42,48,59), TXT(255,232,235,240),
+    MUTED(255,138,147,163), DIM(255,96,104,118), ACC(255,61,169,252),
+    TEAL(255,0,209,178), DARK(255,10,16,24);
+}
+
+static ULONG_PTR g_gdipToken = 0;
+static Gdiplus::FontFamily* g_ff = nullptr;
+static Gdiplus::Font *g_f16b=nullptr, *g_f13=nullptr, *g_f13b=nullptr, *g_f11=nullptr, *g_f10=nullptr;
+
+static void UiInitFonts() {
+    if (g_ff) return;
+    g_ff   = new Gdiplus::FontFamily(L"Microsoft YaHei");
+    g_f16b = new Gdiplus::Font(g_ff, 16.f, Gdiplus::FontStyleBold,    Gdiplus::UnitPixel);
+    g_f13  = new Gdiplus::Font(g_ff, 13.f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    g_f13b = new Gdiplus::Font(g_ff, 13.f, Gdiplus::FontStyleBold,    Gdiplus::UnitPixel);
+    g_f11  = new Gdiplus::Font(g_ff, 11.f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    g_f10  = new Gdiplus::Font(g_ff, 10.f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+}
+
+// ---- 双缓冲 ----
+static HBITMAP g_dib = nullptr; static HDC g_dibDC = nullptr; static void* g_dibBits = nullptr;
+static int g_dibW = 0, g_dibH = 0;
+static bool EnsureDib(int w, int h, HDC ref) {
+    if (g_dib && w == g_dibW && h == g_dibH) return true;
+    if (g_dib) { DeleteObject(g_dib); g_dib = nullptr; }
+    if (g_dibDC) { DeleteDC(g_dibDC); g_dibDC = nullptr; }
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    g_dibDC = CreateCompatibleDC(ref);
+    g_dib = CreateDIBSection(g_dibDC, &bi, DIB_RGB_COLORS, &g_dibBits, nullptr, 0);
+    if (!g_dib) return false;
+    SelectObject(g_dibDC, g_dib);
+    g_dibW = w; g_dibH = h;
+    return true;
+}
+
+// ---- 绘制小工具 ----
+static void Txt(Gdiplus::Graphics& g, const wchar_t* s, float x, float y, float w, float h,
+                Gdiplus::Font* f, const Gdiplus::Color& c, int align = 0) {
+    Gdiplus::StringFormat sf;
+    sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    sf.SetAlignment(align == 0 ? Gdiplus::StringAlignmentNear
+                   : align == 1 ? Gdiplus::StringAlignmentCenter
+                                : Gdiplus::StringAlignmentFar);
+    sf.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+    sf.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+    Gdiplus::SolidBrush br(c);
+    g.DrawString(s, -1, f, Gdiplus::RectF(x, y, w, h), &sf, &br);
+}
+
+static void FillRound(Gdiplus::Graphics& g, Gdiplus::RectF r, float rad, const Gdiplus::Color& c) {
+    if (r.Width <= 0 || r.Height <= 0) return;
+    Gdiplus::GraphicsPath p; float d = rad * 2;
+    p.AddArc(r.X, r.Y, d, d, 180, 90);
+    p.AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
+    p.AddArc(r.X + r.Width - d, r.Y + r.Height - d, d, d, 0, 90);
+    p.AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
+    p.CloseFigure();
+    Gdiplus::SolidBrush b(c); g.FillPath(&b, &p);
+}
+
+static void StrokeRound(Gdiplus::Graphics& g, Gdiplus::RectF r, float rad, const Gdiplus::Color& c, float w = 1.f) {
+    if (r.Width <= 0 || r.Height <= 0) return;
+    Gdiplus::GraphicsPath p; float d = rad * 2;
+    p.AddArc(r.X, r.Y, d, d, 180, 90);
+    p.AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
+    p.AddArc(r.X + r.Width - d, r.Y + r.Height - d, d, d, 0, 90);
+    p.AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
+    p.CloseFigure();
+    Gdiplus::Pen pen(c, w); g.DrawPath(&pen, &p);
+}
+
+static void Tri(Gdiplus::Graphics& g, float cx, float cy, float s, const Gdiplus::Color& c) {
+    Gdiplus::PointF pts[3] = { { cx - s*0.55f, cy - s*0.7f }, { cx - s*0.55f, cy + s*0.7f }, { cx + s*0.8f, cy } };
+    Gdiplus::SolidBrush b(c); g.FillPolygon(&b, pts, 3);
+}
+static void Sq(Gdiplus::Graphics& g, float cx, float cy, float s, const Gdiplus::Color& c) {
+    Gdiplus::SolidBrush b(c); g.FillRectangle(&b, cx - s*0.6f, cy - s*0.6f, s*1.2f, s*1.2f);
+}
+
+static Gdiplus::Color FamColor(int fam) {
+    switch (fam) {
+        case FAM_METALHEART: return Gdiplus::Color(255, 0, 190, 160);
+        case FAM_CUBE:       return Gdiplus::Color(255, 240, 150, 60);
+        case FAM_3D:         return Gdiplus::Color(255, 150, 120, 240);
+        case FAM_LAYERS:     return Gdiplus::Color(255, 230, 90, 170);
+        default:             return UIX::ACC;
+    }
+}
+static const wchar_t* FamName(int fam) {
+    switch (fam) {
+        case FAM_METALHEART: return L"Metalheart";
+        case FAM_CUBE:       return L"Cube";
+        case FAM_3D:         return L"3D";
+        case FAM_LAYERS:     return L"Layers";
+        default:             return L"常规";
+    }
+}
+
+// ---- 几何 ----
+static RECT g_rCard[64];   static int g_cardEff[64];  static int g_nCard = 0;
+// 悬停命中（和点击用的是同一套几何，所以高亮和可点区域永远一致）
+static int  g_uiHoverKind = 0, g_uiHoverIdx = -1;
+
+static RECT g_rChip[8];    static int g_chipFam[8];   static int g_nChip = 0;
+static RECT g_rRow[16];    static int g_nRow = 0;
+static int  g_rowPl[16] = {0};   // 每行对应播放链里的第几项
+static RECT g_rPlay, g_rStop, g_rBlend, g_rOpTrack, g_rDur, g_rSet, g_rPreset[5];
+
+static const int  kMargin = 24, kGap = 12, kCols = 4, kCardH = 150;
+static const int  kGridTop = 96;
+// 底部 dock 的高度固定，位置跟着【客户区高度】走 —— 窗口 750 是含标题栏和菜单栏的，
+// 客户区只有 ~682，写死 566 会把最下面一排控件顶到看不见的地方。
+static const int  kDockH = 190;
+static int  kDockTop = 566;          // 由 UiBuild 按实际客户区高度算出
+static int  kGridBottom = 556;       // = kDockTop - 10
+
+static const wchar_t* FamNameForChip(int f) {
+    switch (f) {
+        case 1: return L"常规";
+        case 2: return L"Metalheart";
+        case 3: return L"Cube";
+        case 4: return L"3D";
+        case 5: return L"Layers";
+        default: return L"全部";
+    }
+}
+
+static int UiFilteredCount() {
+    if (g_uiFilter == 0) return g_effectCount;
+    int n = 0;
+    for (int i = 0; i < g_effectCount; ++i) if (EffFamily(i) == g_uiFilter - 1) ++n;
+    return n;
+}
+static int UiFilteredAt(int k) {
+    if (g_uiFilter == 0) return (k >= 0 && k < g_effectCount) ? k : -1;
+    int n = 0;
+    for (int i = 0; i < g_effectCount; ++i)
+        if (EffFamily(i) == g_uiFilter - 1) { if (n == k) return i; ++n; }
+    return -1;
+}
+static int UiFamCount(int f) {
+    if (f == 0) return g_effectCount;
+    int n = 0;
+    for (int i = 0; i < g_effectCount; ++i) if (EffFamily(i) == f - 1) ++n;
+    return n;
+}
+
+static void UiBuild(int W, int H) {
+    kDockTop    = H - kDockH;
+    kGridBottom = kDockTop - 10;
+    int cardW = (W - 2*kMargin - (kCols-1)*kGap) / kCols;
+    g_nCard = 0;
+    int total = UiFilteredCount();
+    int rows = (total + kCols - 1) / kCols;
+    for (int r = 0; r < rows && g_nCard < 64; ++r)
+        for (int c = 0; c < kCols && g_nCard < 64; ++c) {
+            int k = r*kCols + c;
+            if (k >= total) break;
+            int x = kMargin + c*(cardW + kGap);
+            int y = kGridTop + r*(kCardH + kGap) - (int)g_uiScroll;
+            g_rCard[g_nCard] = { x, y, x + cardW, y + kCardH };
+            g_cardEff[g_nCard] = UiFilteredAt(k);
+            g_nCard++;
+        }
+
+    g_nChip = 0;
+    int cx = kMargin;
+    for (int f = 0; f <= FAM_COUNT; ++f) {
+        wchar_t probe[64];
+        _snwprintf(probe, 64, L"%s %d", FamNameForChip(f), UiFamCount(f));
+        int w = (int)wcslen(probe) * 8 + 28;   // 粗算宽度：中文/英文混排取个保守值
+        if (cx + w > W - kMargin) break;
+        g_rChip[g_nChip] = { cx, 56, cx + w, 84 };
+        g_chipFam[g_nChip] = f;
+        cx += w + 8;
+        g_nChip++;
+    }
+
+    // 播放链：只画 kPlRows 行，靠 g_uiScrollPl 滚动
+    {
+        int total = (int)g_playlist.size();
+        if (g_uiScrollPl > total - kPlRows) g_uiScrollPl = total - kPlRows;
+        if (g_uiScrollPl < 0) g_uiScrollPl = 0;
+    }
+    g_nRow = 0;
+    int rowY = kDockTop + 44;
+    for (int i = 0; i < kPlRows && (g_uiScrollPl + i) < (int)g_playlist.size(); ++i) {
+        g_rRow[g_nRow] = { kMargin, rowY, 552, rowY + 36 };
+        g_rowPl[g_nRow] = g_uiScrollPl + i;
+        rowY += 40;
+        g_nRow++;
+    }
+
+    int px = 580, pw = W - kMargin - px;
+    g_rPlay  = { px, kDockTop + 44, px + 150, kDockTop + 88 };
+    g_rStop  = { px + 158, kDockTop + 44, px + pw, kDockTop + 88 };
+    g_rBlend = { px, kDockTop + 96, px + pw, kDockTop + 134 };
+    g_rOpTrack = { px + 78, kDockTop + 146, px + pw - 46, kDockTop + 154 };
+    g_rDur = { 420, kDockTop + 8, 520, kDockTop + 36 };
+    for (int i = 0; i < 5; ++i) g_rPreset[i] = { 640 + i*44, kDockTop + 8, 676 + i*44, kDockTop + 36 };
+    g_rSet = { W - kMargin - 72, kDockTop + 8, W - kMargin, kDockTop + 36 };
+}
+
+// ============================================================================
+// 效果缩略图：每个效果离屏渲一帧 → 读回 → 缓存成 GDI+ 位图
+//
+// 关键前提：主窗口没有 OpenGL 上下文（GL 上下文只活在播放窗）。所以这里复用
+// WinMain 启动时那个"临时上下文"——它本来就已经 LoadEffects() 过一遍，把 shader
+// 全编好了，正好拿来渲染缩略图。每帧只渲 1 张，避免一开机卡住。
+// ============================================================================
+static HWND g_thumbHwnd = nullptr; static HDC g_thumbDC = nullptr; static HGLRC g_thumbRC = nullptr;
+static const int TH_W = 388, TH_H = 192;      // 与卡片缩略图同比例（194:96），避免拉伸
+static GLuint g_thFbo = 0, g_thTex = 0;
+static std::vector<unsigned char>        g_thBuf;
+static std::vector<Gdiplus::Bitmap*>     g_thBmp;    // 每效果一张；nullptr = 还没生成
+static std::vector<unsigned char>        g_thDone;
+
+static void ThumbReset() {
+    for (auto* b : g_thBmp) delete b;
+    g_thBmp.assign(g_effectCount, nullptr);
+    g_thDone.assign(g_effectCount, 0);
+}
+
+// 渲一张。返回 true 表示生成成功。
+static bool ThumbMake(int idx) {
+    if (!g_thumbRC || idx < 0 || idx >= g_effectCount) return false;
+    if (idx < (int)g_thBmp.size() && g_thBmp[idx]) return true;
+
+    HDC   oldDC = wglGetCurrentDC();
+    HGLRC oldRC = wglGetCurrentContext();
+    if (!wglMakeCurrent(g_thumbDC, g_thumbRC)) return false;
+
+    if (!g_thFbo) {
+        glGenTextures(1, &g_thTex);
+        glBindTexture(GL_TEXTURE_2D, g_thTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, TH_W, TH_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glGenFramebuffers(1, &g_thFbo);
+        glBindFramebuffer(GL_FRAMEBUFFER, g_thFbo);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_thTex, 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+
+    // 【状态复位】渲染器之间会互相串状态：上个效果可能留下 scissor / 颜色掩码 /
+    // READ-DRAW 分离绑定 / 混合。不清掉的话，下一个效果"画了但看不到"，
+    // 读回来的还是上一张（缩略图串图就是这么来的）。
+    glBindFramebuffer(GL_FRAMEBUFFER, g_thFbo);
+    glViewport(0, 0, TH_W, TH_H);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // 【预热】网格类效果的几何位置由 PLUpdate 推进的相位决定；没播放时那些相位是 0，
+    // 图层会全部落在相机背后 → 画出来是黑的。缩略图是静态截帧，这里给一组"进行中"的值。
+    {
+        const float saveExit = g_plExitT;
+        g_plExitT   = 999.0f;
+        g_vxPhase   = -6.0f;  g_vxFormT = 99.0f;  g_vxHitT = 999.0f;
+        g_ssPhase   = 0.35f;  g_ssCamT  = 99.0f;  g_ssHitAge = 999.0f;  g_ssTransMix = 0.0f;
+        g_f1EntryT  = 5.00f;  g_f1HitAge = 999.0f;
+        g_pcCurvePos = 0.15f; g_pcCurveTarget = 0.15f;
+        DrawEffect(idx, 6.0f, 120.0f, 0.0f, 1.0f, (float)TH_W, (float)TH_H, true, 1.0f);
+        g_plExitT = saveExit;
+    }
+
+    // 渲染器（多遍效果 / 泛光合成）可能把 READ / DRAW 拆开绑到自己的 FBO 上，
+    // 读像素前必须把两个都钉回我们的缩略图 FBO，否则读的是人家的场景缓冲。
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, g_thFbo);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_thFbo);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    g_thBuf.resize((size_t)TH_W * TH_H * 4);
+    glReadPixels(0, 0, TH_W, TH_H, GL_RGBA, GL_UNSIGNED_BYTE, g_thBuf.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    wglMakeCurrent(oldDC, oldRC);
+
+    // 【几乎全黑就不收】—— 这 6 个网格效果（粒子/渐开线/台阶/曲面/隧道/碎片）的几何
+    // 位置与浓淡由 PLUpdate 每帧推进的状态决定，没有播放时截出来是空的。
+    // 与其显示一排黑卡片，不如退回家族色占位。
+    {
+        double rgbSum = 0; size_t n = 0;
+        for (size_t i = 0; i + 3 < g_thBuf.size(); i += 4) { rgbSum += g_thBuf[i] + g_thBuf[i+1] + g_thBuf[i+2]; n += 3; }
+        if (n && rgbSum / (double)n < 3.0) return false;
+    }
+
+    // GL 是自下而上，GDI+ 是自上而下；同时把 RGBA 换成 BGRA
+    Gdiplus::Bitmap* bmp = new Gdiplus::Bitmap(TH_W, TH_H, PixelFormat32bppARGB);
+    Gdiplus::Rect rc(0, 0, TH_W, TH_H);
+    Gdiplus::BitmapData bd = {};
+    if (bmp->LockBits(&rc, Gdiplus::ImageLockModeWrite, PixelFormat32bppARGB, &bd) == Gdiplus::Ok) {
+        for (int y = 0; y < TH_H; ++y) {
+            const unsigned char* src = g_thBuf.data() + (size_t)(TH_H - 1 - y) * TH_W * 4;
+            unsigned char* dst = (unsigned char*)bd.Scan0 + (size_t)y * bd.Stride;
+            for (int x = 0; x < TH_W; ++x) {
+                dst[x*4+0] = src[x*4+2];   // B
+                dst[x*4+1] = src[x*4+1];   // G
+                dst[x*4+2] = src[x*4+0];   // R
+                dst[x*4+3] = 255;
+            }
+        }
+        bmp->UnlockBits(&bd);
+    }
+    if ((int)g_thBmp.size() < g_effectCount) g_thBmp.resize(g_effectCount, nullptr);
+    g_thBmp[idx] = bmp;
+    if ((int)g_thDone.size() < g_effectCount) g_thDone.resize(g_effectCount, 0);
+    g_thDone[idx] = 1;
+    return true;
+}
+
+// 每次调用最多生成 budget 张（挂在 60fps 定时器上，画面不会卡）
+static void ThumbPump(int budget) {
+    if (!g_thumbRC) return;
+    if ((int)g_thBmp.size() < g_effectCount) { g_thBmp.resize(g_effectCount, nullptr); g_thDone.resize(g_effectCount, 0); }
+    int made = 0;
+    for (int i = 0; i < g_effectCount && made < budget; ++i) {
+        if (!g_thBmp[i]) { if (ThumbMake(i)) ++made; }
+    }
+    if (made && g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// ---- 命中与点击 ----
+
+// ---- 命中与点击 ----
+enum { HIT_NONE = 0, HIT_CHIP, HIT_CARD, HIT_ROW, HIT_PLAY, HIT_STOP, HIT_BLEND,
+       HIT_OPACITY, HIT_DUR, HIT_SET, HIT_PRESET };
+static int g_hitKind = HIT_NONE, g_hitIdx = -1;
+
+// ---- 绘制 ----
+static void UiPaint(HDC hdc, int W, int H) {
+    UiInitFonts();
+    if (!EnsureDib(W, H, hdc)) return;
+    UiBuild(W, H);
+
+    Gdiplus::Graphics g(g_dibDC);
+    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
+
+    Gdiplus::SolidBrush bBG(UIX::BG);   g.FillRectangle(&bBG, 0, 0, W, H);
+
+    {   // 标题
+        Gdiplus::SolidBrush bAcc(UIX::ACC);
+        g.FillEllipse(&bAcc, (float)kMargin, 22.f, 10.f, 10.f);
+        Txt(g, L"ALLVSLZATION", (float)kMargin + 18.f, 16.f, 400.f, 24.f, g_f16b, UIX::TXT);
+        Gdiplus::RectF r((float)g_rSet.left, (float)g_rSet.top,
+                         (float)(g_rSet.right-g_rSet.left), (float)(g_rSet.bottom-g_rSet.top));
+        bool hov = (g_uiHoverKind == HIT_SET);
+        FillRound(g, r, 8.f, hov ? UIX::CARD2 : UIX::CARD);
+        StrokeRound(g, r, 8.f, hov ? Gdiplus::Color(255,70,80,96) : UIX::LN);
+        Txt(g, L"设置", r.X, r.Y, r.Width, r.Height, g_f11, UIX::MUTED, 1);
+    }
+
+    // 家族 chips
+    for (int i = 0; i < g_nChip; ++i) {
+        int f = g_chipFam[i];
+        wchar_t buf[64];
+        _snwprintf(buf, 64, L"%s %d", FamNameForChip(f), UiFamCount(f));
+        Gdiplus::RectF r((float)g_rChip[i].left, (float)g_rChip[i].top,
+                         (float)(g_rChip[i].right-g_rChip[i].left), (float)(g_rChip[i].bottom-g_rChip[i].top));
+        bool on = (g_uiFilter == f);
+        bool hover = (g_uiHoverKind == HIT_CHIP && g_uiHoverIdx == i);
+        FillRound(g, r, 14.f, on ? UIX::ACC : (hover ? UIX::CARD2 : UIX::CARD));
+        if (!on) StrokeRound(g, r, 14.f, hover ? Gdiplus::Color(255,70,80,96) : UIX::LN);
+        Txt(g, buf, r.X, r.Y, r.Width, r.Height, g_f11, on ? UIX::DARK : UIX::MUTED, 1);
+    }
+
+    // 画廊
+    g.SetClip(Gdiplus::RectF(0.f, (float)kGridTop, (float)W, (float)(kGridBottom - kGridTop)));
+    for (int i = 0; i < g_nCard; ++i) {
+        int eff = g_cardEff[i];
+        if (eff < 0) continue;
+        Gdiplus::RectF r((float)g_rCard[i].left, (float)g_rCard[i].top,
+                         (float)(g_rCard[i].right-g_rCard[i].left), (float)(g_rCard[i].bottom-g_rCard[i].top));
+        bool sel   = (eff == g_uiSelEffect);
+        bool hover = (g_uiHoverKind == HIT_CARD && g_uiHoverIdx == i);
+        FillRound(g, r, 10.f, hover ? UIX::CARD2 : UIX::CARD);
+        StrokeRound(g, r, 10.f, sel ? UIX::ACC : (hover ? Gdiplus::Color(255,70,80,96) : UIX::LN),
+                    sel ? 1.6f : 1.f);
+
+        Gdiplus::RectF th(r.X + 6, r.Y + 6, r.Width - 12, 96.f);
+        {
+            Gdiplus::GraphicsPath tp; float d = 14.f;
+            tp.AddArc(th.X, th.Y, d, d, 180, 90);
+            tp.AddArc(th.X + th.Width - d, th.Y, d, d, 270, 90);
+            tp.AddArc(th.X + th.Width - d, th.Y + th.Height - d, d, d, 0, 90);
+            tp.AddArc(th.X, th.Y + th.Height - d, d, d, 90, 90);
+            tp.CloseFigure();
+            Gdiplus::Bitmap* thumb = (eff < (int)g_thBmp.size()) ? g_thBmp[eff] : nullptr;
+            if (thumb) {
+                // 真画面：裁成圆角卡片再贴
+                Gdiplus::Region oldRgn; g.GetClip(&oldRgn);
+                g.SetClip(&tp);
+                g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+                g.DrawImage(thumb, th.X, th.Y, th.Width, th.Height);
+                g.SetClip(&oldRgn);
+                Gdiplus::SolidBrush ov(Gdiplus::Color(30, 8, 10, 16));   // 轻微压暗，文字更清楚
+                g.FillPath(&ov, &tp);
+            } else {
+                // 还没生成出来：先用家族色占位
+                Gdiplus::Color fc = FamColor(EffFamily(eff));
+                Gdiplus::LinearGradientBrush lg(Gdiplus::PointF(th.X, th.Y),
+                                                Gdiplus::PointF(th.X + th.Width, th.Y + th.Height),
+                                                Gdiplus::Color(255, 18, 22, 30), fc);
+                g.FillPath(&lg, &tp);
+                Gdiplus::SolidBrush ov(Gdiplus::Color(130, 8, 10, 16));
+                g.FillPath(&ov, &tp);
+            }
+        }
+        Txt(g, g_effects[eff].name.c_str(), r.X + 10, r.Y + 104, r.Width - 20, 20, g_f13b, UIX::TXT);
+        Txt(g, FamName(EffFamily(eff)), r.X + 10, r.Y + 124, r.Width - 40, 16, g_f10, UIX::DIM);
+        Gdiplus::Color dc = EffGpuAvail(eff) ? UIX::TEAL : Gdiplus::Color(255, 230, 80, 80);
+        Gdiplus::SolidBrush db(dc);
+        g.FillEllipse(&db, r.X + r.Width - 20, r.Y + 128, 7.f, 7.f);
+    }
+    g.ResetClip();
+
+    // dock
+    {
+        Gdiplus::SolidBrush bPanel(UIX::PANEL);
+        g.FillRectangle(&bPanel, 0, kDockTop, W, H - kDockTop);
+        Gdiplus::Pen penLine(UIX::LN, 1.f);
+        g.DrawLine(&penLine, 0.f, (float)kDockTop, (float)W, (float)kDockTop);
+
+        wchar_t buf[64];
+        _snwprintf(buf, 64, L"播放链  %d 项", (int)g_playlist.size());
+        Txt(g, buf, (float)kMargin, (float)kDockTop + 8, 300, 28, g_f13b, UIX::TXT);
+
+        {   // 时长
+            Gdiplus::RectF r((float)g_rDur.left, (float)g_rDur.top,
+                             (float)(g_rDur.right-g_rDur.left), (float)(g_rDur.bottom-g_rDur.top));
+            FillRound(g, r, 8.f, UIX::CARD); StrokeRound(g, r, 8.f, UIX::LN);
+            wchar_t s[32]; _snwprintf(s, 32, L"时长 %ds", g_uiDurSec);
+            Txt(g, s, r.X, r.Y, r.Width, r.Height, g_f11, UIX::MUTED, 1);
+        }
+        for (int i = 0; i < 5; ++i) {   // 预设
+            Gdiplus::RectF r((float)g_rPreset[i].left, (float)g_rPreset[i].top,
+                             (float)(g_rPreset[i].right-g_rPreset[i].left), (float)(g_rPreset[i].bottom-g_rPreset[i].top));
+            bool has = !g_presets[i].empty();
+            FillRound(g, r, 8.f, has ? UIX::CARD2 : UIX::CARD);
+            StrokeRound(g, r, 8.f, has ? UIX::ACC : UIX::LN);
+            wchar_t s[8]; _snwprintf(s, 8, L"%d", i+1);
+            Txt(g, s, r.X, r.Y, r.Width, r.Height, g_f11, has ? UIX::ACC : UIX::DIM, 1);
+        }
+
+        for (int i = 0; i < g_nRow; ++i) {
+            int pl = g_rowPl[i];
+            if (pl < 0 || pl >= (int)g_playlist.size()) continue;
+            auto& it = g_playlist[pl];
+            Gdiplus::RectF r((float)g_rRow[i].left, (float)g_rRow[i].top,
+                             (float)(g_rRow[i].right-g_rRow[i].left), (float)(g_rRow[i].bottom-g_rRow[i].top));
+            bool sel   = (pl == g_uiSelPl);
+            bool hover = (g_uiHoverKind == HIT_ROW && g_uiHoverIdx == i);
+            FillRound(g, r, 8.f, (sel || hover) ? UIX::CARD2 : UIX::CARD);
+            if (sel) { Gdiplus::SolidBrush ab(UIX::ACC); g.FillRectangle(&ab, r.X, r.Y + 8, 3.f, r.Height - 16); }
+            wchar_t idx[8]; _snwprintf(idx, 8, L"%02d", pl+1);
+            Txt(g, idx, r.X + 14, r.Y, 40, r.Height, g_f10, sel ? UIX::ACC : UIX::DIM);
+            Txt(g, it.name.c_str(), r.X + 52, r.Y + 1, r.Width - 220, 20, g_f13, UIX::TXT);
+            wchar_t sub[160];
+            _snwprintf(sub, 160, L"%s%s · %d 秒", FamName(EffFamily(EffectIndex(it.name))),
+                       it.name2.empty() ? L"" : L" + 上层", it.durationSec);
+            Txt(g, sub, r.X + 52, r.Y + 20, r.Width - 220, 16, g_f10, UIX::DIM);
+            wchar_t dur[16]; _snwprintf(dur, 16, L"%ds", it.durationSec);
+            Txt(g, dur, r.X + r.Width - 58, r.Y, 44, r.Height, g_f10, UIX::MUTED, 2);
+        }
+
+        // 播放链滚动条（超过 kPlRows 项时出现）
+        if ((int)g_playlist.size() > kPlRows) {
+            float trackX = 560.f, trackY = (float)(kDockTop + 44), trackH = 3 * 40.f - 4.f;
+            Gdiplus::SolidBrush tb(UIX::LN);
+            g.FillRectangle(&tb, trackX, trackY, 3.f, trackH);
+            float frac = (float)kPlRows / (float)g_playlist.size();
+            float thumbH = trackH * frac;
+            float thumbY = trackY + (trackH - thumbH) * ((float)g_uiScrollPl / (float)(g_playlist.size() - kPlRows));
+            Gdiplus::SolidBrush thb(UIX::ACC);
+            g.FillRectangle(&thb, trackX, thumbY, 3.f, thumbH);
+        }
+
+        {   // 播放 / 停止
+            Gdiplus::RectF rp((float)g_rPlay.left, (float)g_rPlay.top,
+                              (float)(g_rPlay.right-g_rPlay.left), (float)(g_rPlay.bottom-g_rPlay.top));
+            FillRound(g, rp, 10.f, UIX::ACC);
+            Tri(g, rp.X + 26, rp.Y + rp.Height/2, 9, UIX::DARK);
+            Txt(g, L"播放链", rp.X + 44, rp.Y, rp.Width - 50, rp.Height, g_f13b, UIX::DARK);
+
+            Gdiplus::RectF rs((float)g_rStop.left, (float)g_rStop.top,
+                              (float)(g_rStop.right-g_rStop.left), (float)(g_rStop.bottom-g_rStop.top));
+            bool hovS = (g_uiHoverKind == HIT_STOP);
+            FillRound(g, rs, 10.f, hovS ? UIX::CARD2 : UIX::CARD);
+            StrokeRound(g, rs, 10.f, hovS ? Gdiplus::Color(255,70,80,96) : UIX::LN);
+            Sq(g, rs.X + 26, rs.Y + rs.Height/2, 7, UIX::MUTED);
+            Txt(g, L"停止", rs.X + 44, rs.Y, rs.Width - 50, rs.Height, g_f13, UIX::MUTED);
+        }
+
+        {   // 混合
+            const wchar_t* bms[] = {L"无混合",L"变亮",L"滤色",L"叠加",L"强光",L"柔光",L"线性加深",L"正片叠底"};
+            int mode = (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size()) ? (int)g_playlist[g_uiSelPl].blendMode : 0;
+            if (mode < 0 || mode > 7) mode = 0;
+            Gdiplus::RectF r((float)g_rBlend.left, (float)g_rBlend.top,
+                             (float)(g_rBlend.right-g_rBlend.left), (float)(g_rBlend.bottom-g_rBlend.top));
+            bool hovB = (g_uiHoverKind == HIT_BLEND);
+            FillRound(g, r, 8.f, hovB ? UIX::CARD2 : UIX::CARD);
+            StrokeRound(g, r, 8.f, hovB ? Gdiplus::Color(255,70,80,96) : UIX::LN);
+            Txt(g, L"混合", r.X + 12, r.Y, 60, r.Height, g_f10, UIX::DIM);
+            Txt(g, bms[mode], r.X + 60, r.Y, r.Width - 72, r.Height, g_f11, UIX::TXT);
+        }
+
+        {   // 不透明度
+            float op = (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size()) ? g_playlist[g_uiSelPl].opacity : 1.f;
+            Gdiplus::RectF tr((float)g_rOpTrack.left, (float)g_rOpTrack.top,
+                              (float)(g_rOpTrack.right-g_rOpTrack.left), (float)(g_rOpTrack.bottom-g_rOpTrack.top));
+            Txt(g, L"不透明度", tr.X - 70, tr.Y - 14, 64, 24, g_f10, UIX::DIM);
+            FillRound(g, tr, 4.f, UIX::LN);
+            FillRound(g, Gdiplus::RectF(tr.X, tr.Y, tr.Width * op, tr.Height), 4.f, UIX::ACC);
+            Gdiplus::SolidBrush wb(UIX::TXT);
+            g.FillEllipse(&wb, tr.X + tr.Width*op - 7.f, tr.Y - 3.f, 14.f, 14.f);
+            wchar_t s[16]; _snwprintf(s, 16, L"%d%%", (int)(op*100));
+            Txt(g, s, tr.X + tr.Width + 8, tr.Y - 14, 50, 24, g_f10, UIX::ACC, 2);
+        }
+    }
+
+    Txt(g, g_uiStatus.c_str(), (float)kMargin, (float)H - 18.f, (float)W - 2*kMargin, 16.f, g_f10, UIX::DIM);
+
+    BitBlt(hdc, 0, 0, W, H, g_dibDC, 0, 0, SRCCOPY);
+}
+
+// ---- 命中与点击 ----
+
+static bool InRect(const RECT& r, int x, int y) {
+    return x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+}
+
+static void UiHitTest(int x, int y) {
+    g_hitKind = HIT_NONE; g_hitIdx = -1;
+    if (y >= kGridTop && y < kGridBottom)
+        for (int i = 0; i < g_nCard; ++i)
+            if (InRect(g_rCard[i], x, y)) { g_hitKind = HIT_CARD; g_hitIdx = i; return; }
+    for (int i = 0; i < g_nChip; ++i)
+        if (InRect(g_rChip[i], x, y)) { g_hitKind = HIT_CHIP; g_hitIdx = i; return; }
+    for (int i = 0; i < g_nRow; ++i)
+        if (InRect(g_rRow[i], x, y)) { g_hitKind = HIT_ROW; g_hitIdx = i; return; }   // i = 行号，单击时再映射
+    if (InRect(g_rPlay, x, y))  { g_hitKind = HIT_PLAY;  return; }
+    if (InRect(g_rStop, x, y))  { g_hitKind = HIT_STOP;  return; }
+    if (InRect(g_rBlend, x, y)) { g_hitKind = HIT_BLEND; return; }
+    if (InRect(g_rOpTrack, x, y)) { g_hitKind = HIT_OPACITY; return; }
+    if (InRect(g_rDur, x, y))   { g_hitKind = HIT_DUR;   return; }
+    if (InRect(g_rSet, x, y))   { g_hitKind = HIT_SET;   return; }
+    for (int i = 0; i < 5; ++i)
+        if (InRect(g_rPreset[i], x, y)) { g_hitKind = HIT_PRESET; g_hitIdx = i; return; }
+}
+
+static void UiClick(int x, int y) {
+    RECT rc; GetClientRect(g_hwnd, &rc);
+    UiBuild(rc.right, rc.bottom);
+    UiHitTest(x, y);
+    switch (g_hitKind) {
+    case HIT_CHIP:
+        g_uiFilter = g_chipFam[g_hitIdx];
+        g_uiScroll = 0;
+        break;
+    case HIT_CARD:
+        g_uiSelEffect = g_cardEff[g_hitIdx];
+        PlaylistAdd();
+        break;
+    case HIT_ROW:
+        g_uiSelPl = g_rowPl[g_hitIdx];
+        break;
+    case HIT_PLAY:  PlaylistStart(); break;
+    case HIT_STOP:  PlaylistStop();  break;
+    case HIT_BLEND:
+        if (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size()) {
+            int m = ((int)g_playlist[g_uiSelPl].blendMode + 1) % 8;
+            g_playlist[g_uiSelPl].blendMode = (BlendMode)m;
+            g_blendMode = m;
+        }
+        break;
+    case HIT_OPACITY:
+        if (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size()) {
+            float t = (float)(x - g_rOpTrack.left) / (float)(g_rOpTrack.right - g_rOpTrack.left);
+            if (t < 0) t = 0; if (t > 1) t = 1;
+            g_playlist[g_uiSelPl].opacity = t;
+            g_blendOpacity = t;
+        }
+        break;
+    case HIT_DUR: {
+        static const int seq[] = { 15, 20, 30, 45, 60, 90 };
+        int n = (int)(sizeof(seq)/sizeof(seq[0])), i = 0;
+        for (; i < n; ++i) if (seq[i] == g_uiDurSec) break;
+        g_uiDurSec = seq[(i + 1) % n];
+        break;
+    }
+    case HIT_SET: ShowSettingsDialog(g_hwnd); break;
+    case HIT_PRESET: PresetLoad(g_hitIdx); break;
+    default: break;
+    }
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_CREATE: {
         g_hwnd = hwnd; g_sharedMem.Create();
         HFONT f = CreateFontW(16,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei");
 
-        // 顶部菜单栏（设置 → 打开设置对话框）
-        {
-            HMENU bar=CreateMenu();
-            AppendMenuW(bar,MF_STRING,IDM_SETTINGS,L"设置");
-            SetMenu(hwnd,bar);
-        }
+        // 顶部不再挂菜单栏 —— 右上角已经有「设置」按钮了，两条入口重复。
+        // （IDM_SETTINGS 的处理分支保留，将来加菜单还能直接复用）
 
-        int panelH=10;
-        CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_ETCHEDHORZ,10,panelH,880,2,hwnd,nullptr,nullptr,nullptr);
-
-        CreateWindowW(L"STATIC",L"可用的可视化效果",WS_CHILD|WS_VISIBLE|SS_LEFT,20,panelH+8,400,20,hwnd,nullptr,nullptr,nullptr);
-        // 效果分类 TreeView（多家族分组，可折叠）+ GPU/CPU 状态圆点
-        // 树用独立小号字体（13px），让长效果名也不顶到右侧圆点列
-        static HFONT s_treeFont = CreateFontW(15,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei");
-        g_hList=CreateWindowW(WC_TREEVIEWW,nullptr,
-            WS_CHILD|WS_VISIBLE|WS_BORDER|WS_VSCROLL|TVS_HASLINES|TVS_LINESATROOT|TVS_HASBUTTONS|TVS_SHOWSELALWAYS,
-            20,panelH+44,356,414,hwnd,(HMENU)IDC_LIST,nullptr,nullptr);   // 宽356(到x376)；底y=468留空给状态栏
-        SendMessage(g_hList,WM_SETFONT,(WPARAM)s_treeFont,TRUE);
-        // 深色主题：树背景/文字跟随现有 STATIC 深色方案（WM_CTLCOLORSTATIC 用的同色系）
-        SendMessageW(g_hList, TVM_SETBKCOLOR, 0, (LPARAM)RGB(20,20,35));
-        SendMessageW(g_hList, TVM_SETTEXTCOLOR, 0, (LPARAM)RGB(220,220,235));
-        SendMessageW(g_hList, TVM_SETLINECOLOR, 0, (LPARAM)RGB(90,90,120));
-        // GPU/CPU 列位置：按树客户区右端留 ~90px 两列（圆点自绘与表头共用同一 x 基准）
-        {
-            RECT rc; GetClientRect(g_hList, &rc);
-            g_dotClientX_Gpu = rc.right - 62;
-            g_dotClientX_Cpu = rc.right - 22;
-            // 表头两个小标签：父坐标 = 树左(20) + 边框内缩 + 客户 x
-            // 宽度给足(40px)避免 SS_RIGHT 裁掉左半字；文字右缘对齐点列中心
-            RECT wrc; GetWindowRect(g_hList, &wrc);
-            int insetX = ((wrc.right - wrc.left) - (rc.right - rc.left)) / 2;
-            int hx = 20 + insetX;
-            int hdrW = 40, hdrH = 14;
-            g_treeHdrGpu = CreateWindowW(L"STATIC", L"GPU", WS_CHILD|WS_VISIBLE|SS_RIGHT,
-                hx + g_dotClientX_Gpu - hdrW + 7, panelH+30, hdrW, hdrH, hwnd, nullptr, nullptr, nullptr);
-            g_treeHdrCpu = CreateWindowW(L"STATIC", L"CPU", WS_CHILD|WS_VISIBLE|SS_RIGHT,
-                hx + g_dotClientX_Cpu - hdrW + 7, panelH+30, hdrW, hdrH, hwnd, nullptr, nullptr, nullptr);
-            SendMessageW(g_treeHdrGpu, WM_SETFONT, (WPARAM)f, TRUE);
-            SendMessageW(g_treeHdrCpu, WM_SETFONT, (WPARAM)f, TRUE);
-        }
-        RebuildEffectTree();
-
-        CreateWindowW(L"STATIC",L"播放链",WS_CHILD|WS_VISIBLE|SS_LEFT,380,panelH+8,400,20,hwnd,nullptr,nullptr,nullptr);
-        g_hPlaylist=CreateWindowW(L"LISTBOX",nullptr,WS_CHILD|WS_VISIBLE|WS_BORDER|WS_VSCROLL|LBS_NOTIFY|LBS_HASSTRINGS,380,panelH+30,340,190,hwnd,(HMENU)IDC_PLAYLIST,nullptr,nullptr);
-        SendMessage(g_hPlaylist,WM_SETFONT,(WPARAM)f,TRUE);
-
-        int py=panelH+230;
-        CreateWindowW(L"STATIC",L"时长(秒):",WS_CHILD|WS_VISIBLE|SS_RIGHT,380,py+4,60,22,hwnd,nullptr,nullptr,nullptr);
-        g_hEditDur=CreateWindowW(L"EDIT",L"30",WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER,445,py+2,45,24,hwnd,(HMENU)IDC_EDIT_DURATION,nullptr,nullptr);
-        SendMessage(g_hEditDur,WM_SETFONT,(WPARAM)f,TRUE);SendMessage(g_hEditDur,EM_SETLIMITTEXT,3,0);
-
-        CreateWindowW(L"BUTTON",L"加入→",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,380,py+30,70,28,hwnd,(HMENU)IDC_BTN_ADD,nullptr,nullptr);
-        g_hBtnClear=CreateWindowW(L"BUTTON",L"←移除",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,455,py+30,70,28,hwnd,(HMENU)IDC_BTN_REMOVE,nullptr,nullptr);
-        SendMessage(g_hBtnClear,WM_SETFONT,(WPARAM)f,TRUE);
-        g_btnClearOldProc=(WNDPROC)SetWindowLongPtrW(g_hBtnClear,GWLP_WNDPROC,(LONG_PTR)ClearBtnProc);
-        CreateWindowW(L"BUTTON",L"↑",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,535,py+30,35,28,hwnd,(HMENU)IDC_BTN_UP,nullptr,nullptr);
-        CreateWindowW(L"BUTTON",L"↓",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,575,py+30,35,28,hwnd,(HMENU)IDC_BTN_DOWN,nullptr,nullptr);
-
-        g_hBtnPlay=CreateWindowW(L"BUTTON",L"▶ 播放链",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,380,py+66,100,32,hwnd,(HMENU)IDC_BTN_PLAY,nullptr,nullptr);
-        SendMessage(g_hBtnPlay,WM_SETFONT,(WPARAM)f,TRUE);
-        g_hBtnStop=CreateWindowW(L"BUTTON",L"⏹ 停止",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,490,py+66,100,32,hwnd,(HMENU)IDC_BTN_STOP,nullptr,nullptr);
-        SendMessage(g_hBtnStop,WM_SETFONT,(WPARAM)f,TRUE);EnableWindow(g_hBtnStop,FALSE);
-
-        // 混合模式
-        int blendY=py+108;
-        CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_ETCHEDHORZ,380,blendY,370,2,hwnd,nullptr,nullptr,nullptr);
-        CreateWindowW(L"STATIC",L"混合模式:",WS_CHILD|WS_VISIBLE|SS_RIGHT,380,blendY+8,70,22,hwnd,nullptr,nullptr,nullptr);
-        HWND hCombo=CreateWindowW(L"COMBOBOX",nullptr,WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,455,blendY+6,140,200,hwnd,(HMENU)IDC_COMBO_BLEND,nullptr,nullptr);
-        SendMessageW(hCombo,WM_SETFONT,(WPARAM)f,TRUE);
-        const wchar_t* bms[]={L"无混合",L"变亮",L"滤色",L"叠加",L"强光",L"柔光",L"线性加深",L"正片叠底"};
-        for(int i=0;i<8;++i)SendMessageW(hCombo,CB_ADDSTRING,0,(LPARAM)bms[i]);
-        SendMessageW(hCombo,CB_SETCURSEL,0,0);
-        CreateWindowW(L"STATIC",L"不透明:",WS_CHILD|WS_VISIBLE|SS_RIGHT,380,blendY+34,70,22,hwnd,nullptr,nullptr,nullptr);
-        HWND hOp=CreateWindowW(TRACKBAR_CLASSW,nullptr,WS_CHILD|WS_VISIBLE|TBS_HORZ|TBS_NOTICKS,455,blendY+32,130,28,hwnd,(HMENU)IDC_TRACK_OPACITY,nullptr,nullptr);
-        SendMessageW(hOp,TBM_SETRANGE,TRUE,MAKELONG(0,100));SendMessageW(hOp,TBM_SETPOS,TRUE,100);
-        CreateWindowW(L"STATIC",L"100%",WS_CHILD|WS_VISIBLE|SS_LEFT,590,blendY+34,50,22,hwnd,(HMENU)IDC_STATIC_OPACITY,nullptr,nullptr);
-        CreateWindowW(L"BUTTON",L"设为上层",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,380,blendY+62,80,28,hwnd,(HMENU)1133,nullptr,nullptr);
-        CreateWindowW(L"BUTTON",L"清除上层",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,470,blendY+62,80,28,hwnd,(HMENU)1134,nullptr,nullptr);
-
-        // 预设按钮
-        int presetX=730;
-        CreateWindowW(L"STATIC",L"预设",WS_CHILD|WS_VISIBLE|SS_CENTER,presetX,panelH+8,100,18,hwnd,nullptr,nullptr,nullptr);
-        for(int pi=0;pi<5;++pi){wchar_t lbl[32];_snwprintf(lbl,32,L"%d -",pi+1);CreateWindowW(L"BUTTON",lbl,WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,presetX,panelH+28+pi*48,100,40,hwnd,(HMENU)(IDC_PRESET_BASE+pi),nullptr,nullptr);}
-
-        g_hStatus=CreateWindowW(L"STATIC",L"  正在加载 OpenGL shader...",WS_CHILD|WS_VISIBLE|SS_LEFT|SS_SUNKEN,0,panelH+470,900,22,hwnd,(HMENU)IDC_STATUS,nullptr,nullptr);
-
+        // 控件全部改为自绘（UiPaint），这里只保留菜单与定时器
         DeleteObject(f);
+        ThumbReset();
         SetTimer(hwnd, TIMER_INIT, 100, nullptr);
         return 0;
     }
@@ -4769,9 +5318,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if(wParam==TIMER_INIT){KillTimer(hwnd,TIMER_INIT);
             g_audio.Initialize();if(g_audio.IsInitialized())g_drums=BPMDetector(g_audio.GetSampleRate());
             PresetsLoadFromFile();UpdatePresetButtons();SetTimer(hwnd,TIMER_MAIN,16,nullptr);
-            wchar_t st[128];_snwprintf(st,128,L"  就绪 — %d 个效果 | BPM: %.0f",g_effectCount,g_bpm);SetWindowTextW(g_hStatus,st);
+            wchar_t st[128];_snwprintf(st,128,L"就绪 — %d 个效果 · BPM %.0f",g_effectCount,g_bpm);UiStatus(st);
             return 0;}
-        if(wParam==TIMER_MAIN){UpdateBeat();return 0;}
+        if(wParam==TIMER_MAIN){UpdateBeat();ThumbPump(1);return 0;}
         if(wParam==TIMER_CLEAR_HOLD && g_holdingClear){
             if(GetTickCount()-g_holdStartTick >= CLEAR_HOLD_MS){
                 g_holdingClear=false; g_holdCompleted=true; KillTimer(hwnd,TIMER_CLEAR_HOLD);
@@ -4782,7 +5331,105 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }break;
 
-    case WM_PAINT:{PAINTSTRUCT ps;HDC hdc=BeginPaint(hwnd,&ps);DefWindowProc(hwnd,msg,wParam,lParam);if(g_holdingClear){POINT cp=g_holdCursorPt;ScreenToClient(hwnd,&cp);DrawClearRing(hdc,cp);}EndPaint(hwnd,&ps);return 0;}
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        g_clientW = rc.right; g_clientH = rc.bottom;
+        UiPaint(hdc, rc.right, rc.bottom);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+        RECT rc; GetClientRect(hwnd, &rc);
+        UiBuild(rc.right, rc.bottom);
+        UiHitTest(x, y);
+        if (g_hitKind != g_uiHoverKind || g_hitIdx != g_uiHoverIdx) {
+            g_uiHoverKind = g_hitKind; g_uiHoverIdx = g_hitIdx;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        // 可点的东西上手型光标
+        static HCURSOR s_hand = LoadCursorW(nullptr, IDC_HAND);
+        static HCURSOR s_arrow = LoadCursorW(nullptr, IDC_ARROW);
+        SetCursor(g_hitKind == HIT_NONE ? s_arrow : s_hand);
+        // 离开窗口时清掉悬停
+        TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+        TrackMouseEvent(&tme);
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        if (g_uiHoverKind != HIT_NONE) { g_uiHoverKind = HIT_NONE; g_uiHoverIdx = -1; InvalidateRect(hwnd, nullptr, FALSE); }
+        return 0;
+
+    case WM_LBUTTONDOWN: {
+        int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+        UiClick(x, y);
+        return 0;
+    }
+
+    // 右键：播放链这一行 → 上移 / 下移 / 删除；预设格子 → 追加 / 保存 / 清空
+    case WM_RBUTTONUP: {
+        int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+        RECT rc; GetClientRect(hwnd, &rc);
+        UiBuild(rc.right, rc.bottom);
+        UiHitTest(x, y);
+        if (g_hitKind == HIT_ROW) {
+            g_uiSelPl = g_hitIdx;
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING, 1, L"上移");
+            AppendMenuW(m, MF_STRING, 2, L"下移");
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING, 3, L"删除这一项");
+            POINT pt; GetCursorPos(&pt);
+            int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, nullptr);
+            DestroyMenu(m);
+            if (c == 1) PlaylistMoveUp();
+            else if (c == 2) PlaylistMoveDown();
+            else if (c == 3) PlaylistRemove();
+            InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (g_hitKind == HIT_PRESET) {
+            int s = g_hitIdx;
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING, 1, L"追加到播放链");
+            AppendMenuW(m, MF_STRING, 2, L"覆盖保存当前播放链");
+            AppendMenuW(m, MF_STRING, 3, L"清空这个预设");
+            POINT pt; GetCursorPos(&pt);
+            int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, nullptr);
+            DestroyMenu(m);
+            if (c == 1) PresetLoad(s);
+            else if (c == 2) PresetSave(s);
+            else if (c == 3) { PresetDelete(s); UpdatePresetButtons(); }
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    }
+
+    case WM_MOUSEWHEEL: {
+        int dy = GET_WHEEL_DELTA_WPARAM(wParam);
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ScreenToClient(hwnd, &pt);
+        if (pt.y >= kGridTop && pt.y < kGridBottom) {
+            int total = UiFilteredCount();
+            int rows = (total + kCols - 1) / kCols;
+            int contentH = rows * (kCardH + kGap);
+            int viewH = kGridBottom - kGridTop;
+            float maxScroll = (float)(contentH > viewH ? contentH - viewH : 0);
+            g_uiScroll -= dy / 120.0f * 60.0f;
+            if (g_uiScroll < 0) g_uiScroll = 0;
+            if (g_uiScroll > maxScroll) g_uiScroll = maxScroll;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (pt.y >= kDockTop && (int)g_playlist.size() > kPlRows) {
+            // 播放链超过 3 项时，滚轮在 dock 上翻页
+            g_uiScrollPl -= dy / 120;
+            int maxS = (int)g_playlist.size() - kPlRows;
+            if (g_uiScrollPl < 0) g_uiScrollPl = 0;
+            if (g_uiScrollPl > maxS) g_uiScrollPl = maxS;
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+        return 0;
+    }
 
     case WM_COMMAND: {
         WORD id=LOWORD(wParam);
@@ -4913,7 +5560,7 @@ static void GenerateRandomPlaylist() {
         g_playlist.push_back(item);
     }
     RefreshPlaylistUI();
-    if (g_hStatus) SetWindowTextW(g_hStatus, L"  已随机生成播放链");
+    UiStatus(L"已随机生成播放链");
 }
 
 static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -5041,6 +5688,10 @@ static void ShowSettingsDialog(HWND parent) {
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
+    {   // 自绘 UI 需要 GDI+（系统自带）
+        Gdiplus::GdiplusStartupInput gsi;
+        Gdiplus::GdiplusStartup(&g_gdipToken, &gsi, nullptr);
+    }
     // =======================================================================
     // 【声明 DPI 感知】—— 必须在创建任何窗口之前
     // =======================================================================
@@ -5073,9 +5724,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nShow) {
             CompileBlendProgram(false);
             InitVAO();
             wglMakeCurrent(nullptr, nullptr);
-            wglDeleteContext(tmpRC);
-        }
-        ReleaseDC(tmpHwnd, tmpHdc); DestroyWindow(tmpHwnd);
+            // 【不删这个上下文】—— 主窗口没有 GL 上下文，效果缩略图要靠它离屏渲染。
+            // 它已经 LoadEffects() 过一遍，shader 都在，正好复用。
+            g_thumbHwnd = tmpHwnd; g_thumbDC = tmpHdc; g_thumbRC = tmpRC;
+        } else ReleaseDC(tmpHwnd, tmpHdc);
     }
 
     WNDCLASSEXW wc={}; wc.cbSize=sizeof(wc); wc.style=CS_HREDRAW|CS_VREDRAW; wc.lpfnWndProc=WndProc; wc.hInstance=hInst;
