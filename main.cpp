@@ -5006,6 +5006,11 @@ static void UiPaint(HDC hdc, int W, int H) {
 
     Gdiplus::SolidBrush bBG(UIX::BG);   g.FillRectangle(&bBG, 0, 0, W, H);
 
+    // 顶部（标题 + 设置 + 家族 chips）。
+    // 【为什么要放到卡片之后画】滚动时卡片会向上溢出到这块区域；
+    // GDI+ 的 SetClip 在这种场景下不一定兜得住，干脆用"先画底、再盖一条底色、最后画标题"的方式，
+    // 与具体图形库行为无关，永远成立。
+    auto drawHeader = [&]() {
     {   // 标题
         Gdiplus::SolidBrush bAcc(UIX::ACC);
         g.FillEllipse(&bAcc, (float)kMargin, 22.f, 10.f, 10.f);
@@ -5031,6 +5036,8 @@ static void UiPaint(HDC hdc, int W, int H) {
         if (!on) StrokeRound(g, r, 14.f, hover ? Gdiplus::Color(255,70,80,96) : UIX::LN);
         Txt(g, buf, r.X, r.Y, r.Width, r.Height, g_f11, on ? UIX::DARK : UIX::MUTED, 1);
     }
+
+    };
 
     // 画廊
     g.SetClip(Gdiplus::RectF(0.f, (float)kGridTop, (float)W, (float)(kGridBottom - kGridTop)));
@@ -5081,6 +5088,13 @@ static void UiPaint(HDC hdc, int W, int H) {
         g.FillEllipse(&db, r.X + r.Width - 20, r.Y + 128, 7.f, 7.f);
     }
     g.ResetClip();
+
+    // 遮住滚上来的卡片，再画顶部
+    {
+        Gdiplus::SolidBrush band(UIX::BG);
+        g.FillRectangle(&band, 0.f, 0.f, (float)W, (float)kGridTop);
+    }
+    drawHeader();
 
     // dock
     {
