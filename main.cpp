@@ -2967,6 +2967,7 @@ static float g_plTime = 0, g_plOldTime = 0, g_plBpm = 120, g_plPhase = 0;
 // （旧的在飞出、新的不该飞），而渲染读的是同一个全局。
 static float g_plOldExitT = 999.0f;
 static bool g_plBlackBg = false;
+static bool g_plTopmost = true;      // 播放窗口是否置顶（设置对话框里可关）
 static float g_userSpeed = 1.0f;
 static float g_audioStrength = 1.0f;   // 音频驱动全局强度（临时滑杆；定稿后移除）
 static const float BLUR_SEC = 1.20f;   // 跨效果过渡时长（MilkDrop 用户切 1.7s / 自动 2.7s，这里取折中）
@@ -4215,8 +4216,9 @@ static void PlaylistStart() {
         // 清零（客户区 = 整个窗口），于是边框【有功能但不可见】。窗口标题仍传给任务栏。
         const DWORD pstyle = WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
         g_hPlayer = CreateWindowExW(0, L"VizPlayerGPU", title, pstyle, CW_USEDEFAULT,CW_USEDEFAULT,PLAYER_DEFAULT_W,PLAYER_DEFAULT_H, nullptr,nullptr,GetModuleHandle(nullptr),nullptr);
-        // 置顶：设 WS_EX_TOPMOST 标志，播放链窗口保持在其他窗口之上
-        SetWindowPos(g_hPlayer, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+        // 置顶由设置里的「窗口置顶」决定（默认开）
+        SetWindowPos(g_hPlayer, g_plTopmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+                     0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         ShowWindow(g_hPlayer, SW_SHOW); UpdateWindow(g_hPlayer);
     }
     EnableWindow(g_hBtnPlay, FALSE); EnableWindow(g_hBtnStop, TRUE);
@@ -4847,6 +4849,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 #define IDD_DUR_MAX    3015
 #define IDD_AUDIO_STR    3016
 #define IDD_AUDIO_STR_LBL 3017
+#define IDD_TOPMOST      3018
 
 static void ApplyBackground(bool dark) {
     g_plBlackBg = dark;
@@ -4935,6 +4938,9 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         HWND bg=CreateWindowW(L"BUTTON",L"黑底",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,100,y+2,80,24,hwnd,(HMENU)IDD_BG,nullptr,nullptr);
         SendMessageW(bg,WM_SETFONT,(WPARAM)f,TRUE);
         SendMessageW(bg,BM_SETCHECK,g_plBlackBg?BST_CHECKED:BST_UNCHECKED,0);
+        HWND topmost=CreateWindowW(L"BUTTON",L"窗口置顶",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,200,y+2,100,24,hwnd,(HMENU)IDD_TOPMOST,nullptr,nullptr);
+        SendMessageW(topmost,WM_SETFONT,(WPARAM)f,TRUE);
+        SendMessageW(topmost,BM_SETCHECK,g_plTopmost?BST_CHECKED:BST_UNCHECKED,0);
         y+=40;
         // 音频驱动全局强度（临时测试滑杆；定稿后移除）
         CreateWindowW(L"STATIC",L"音频强度:",WS_CHILD|WS_VISIBLE|SS_RIGHT,10,y+4,80,22,hwnd,nullptr,nullptr,nullptr);
@@ -4977,6 +4983,13 @@ static LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPAR
         switch (LOWORD(wParam)) {
         case IDD_TAP: { static float lastTap=0; static int taps=0; float now=(float)GetTickCount()/1000.0f; if(taps>0){float dt=now-lastTap; if(dt>0.1f&&dt<5.0f){SetBPM(60.0f/dt); wchar_t b[16]; _snwprintf(b,16,L"%.0f",g_bpm); SetDlgItemTextW(hwnd,IDD_BPM,b);} } lastTap=now; taps++; } break;
         case IDD_BG: ApplyBackground(SendMessageW(GetDlgItem(hwnd,IDD_BG),BM_GETCHECK,0,0)==BST_CHECKED); break;
+        case IDD_TOPMOST: {
+            g_plTopmost = (SendMessageW(GetDlgItem(hwnd,IDD_TOPMOST),BM_GETCHECK,0,0)==BST_CHECKED);
+            // 播放窗口已经开着就立刻生效，不用关掉重播
+            if (g_hPlayer) SetWindowPos(g_hPlayer, g_plTopmost?HWND_TOPMOST:HWND_NOTOPMOST,
+                                        0,0,0,0, SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
+            break;
+        }
         case IDD_RANDOM: {
             wchar_t buf[16];
             GetDlgItemTextW(hwnd,IDD_CNT_MIN,buf,16); int mn=_wtoi(buf);
