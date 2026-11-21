@@ -4758,11 +4758,14 @@ static const wchar_t* FamName(int fam) {
 static RECT g_rCard[64];   static int g_cardEff[64];  static int g_nCard = 0;
 // 悬停命中（和点击用的是同一套几何，所以高亮和可点区域永远一致）
 static int  g_uiHoverKind = 0, g_uiHoverIdx = -1;
+// 长按「清空」：按住 1 秒才真正清空播放链（防误触）
+static bool   g_uiHoldClear = false;
+static DWORD  g_uiHoldTick  = 0;
 
 static RECT g_rChip[8];    static int g_chipFam[8];   static int g_nChip = 0;
 static RECT g_rRow[16];    static int g_nRow = 0;
 static int  g_rowPl[16] = {0};   // 每行对应播放链里的第几项
-static RECT g_rPlay, g_rStop, g_rBlend, g_rOpTrack, g_rDur, g_rSet, g_rPreset[5];
+static RECT g_rPlay, g_rStop, g_rBlend, g_rOpTrack, g_rDur, g_rClear, g_rSet, g_rPreset[5];
 
 static const int  kMargin = 24, kGap = 12, kCols = 4, kCardH = 150;
 static const int  kGridTop = 96;
@@ -4854,7 +4857,8 @@ static void UiBuild(int W, int H) {
     g_rStop  = { px + 158, kDockTop + 44, px + pw, kDockTop + 88 };
     g_rBlend = { px, kDockTop + 96, px + pw, kDockTop + 134 };
     g_rOpTrack = { px + 78, kDockTop + 146, px + pw - 46, kDockTop + 154 };
-    g_rDur = { 420, kDockTop + 8, 520, kDockTop + 36 };
+    g_rDur   = { 400, kDockTop + 8, 500, kDockTop + 36 };
+    g_rClear = { 508, kDockTop + 8, 588, kDockTop + 36 };
     for (int i = 0; i < 5; ++i) g_rPreset[i] = { 640 + i*44, kDockTop + 8, 676 + i*44, kDockTop + 36 };
     g_rSet = { W - kMargin - 72, kDockTop + 8, W - kMargin, kDockTop + 36 };
 }
@@ -4987,7 +4991,7 @@ static void ThumbPump(int budget) {
 
 // ---- 命中与点击 ----
 enum { HIT_NONE = 0, HIT_CHIP, HIT_CARD, HIT_ROW, HIT_PLAY, HIT_STOP, HIT_BLEND,
-       HIT_OPACITY, HIT_DUR, HIT_SET, HIT_PRESET };
+       HIT_OPACITY, HIT_DUR, HIT_SET, HIT_PRESET, HIT_CLEAR };
 static int g_hitKind = HIT_NONE, g_hitIdx = -1;
 
 // ---- 绘制 ----
@@ -5096,6 +5100,32 @@ static void UiPaint(HDC hdc, int W, int H) {
             wchar_t s[32]; _snwprintf(s, 32, L"时长 %ds", g_uiDurSec);
             Txt(g, s, r.X, r.Y, r.Width, r.Height, g_f11, UIX::MUTED, 1);
         }
+        {   // 清空（长按 1 秒）
+            Gdiplus::RectF r((float)g_rClear.left, (float)g_rClear.top,
+                             (float)(g_rClear.right-g_rClear.left), (float)(g_rClear.bottom-g_rClear.top));
+            bool hov = (g_uiHoverKind == HIT_CLEAR);
+            FillRound(g, r, 8.f, hov ? UIX::CARD2 : UIX::CARD);
+            StrokeRound(g, r, 8.f, hov ? Gdiplus::Color(255,230,100,100) : UIX::LN);
+            // 长按进度：从左往右填
+            if (g_uiHoldClear) {
+                DWORD el = GetTickCount() - g_uiHoldTick;
+                float p = el / 1000.0f; if (p > 1.f) p = 1.f;
+                Gdiplus::Region oldRgn; g.GetClip(&oldRgn);
+                Gdiplus::GraphicsPath cp; float d = 16.f;
+                cp.AddArc(r.X, r.Y, d, d, 180, 90);
+                cp.AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
+                cp.AddArc(r.X + r.Width - d, r.Y + r.Height - d, d, d, 0, 90);
+                cp.AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
+                cp.CloseFigure();
+                g.SetClip(&cp);
+                Gdiplus::SolidBrush hb(Gdiplus::Color(120, 230, 90, 90));
+                g.FillRectangle(&hb, r.X, r.Y, r.Width * p, r.Height);
+                g.SetClip(&oldRgn);
+            }
+            Txt(g, g_uiHoldClear ? L"松开清空…" : L"清空", r.X, r.Y, r.Width, r.Height, g_f11,
+                (hov || g_uiHoldClear) ? Gdiplus::Color(255,240,140,140) : UIX::MUTED, 1);
+        }
+
         for (int i = 0; i < 5; ++i) {   // 预设
             Gdiplus::RectF r((float)g_rPreset[i].left, (float)g_rPreset[i].top,
                              (float)(g_rPreset[i].right-g_rPreset[i].left), (float)(g_rPreset[i].bottom-g_rPreset[i].top));
@@ -5207,9 +5237,79 @@ static void UiHitTest(int x, int y) {
     if (InRect(g_rBlend, x, y)) { g_hitKind = HIT_BLEND; return; }
     if (InRect(g_rOpTrack, x, y)) { g_hitKind = HIT_OPACITY; return; }
     if (InRect(g_rDur, x, y))   { g_hitKind = HIT_DUR;   return; }
+    if (InRect(g_rClear, x, y)) { g_hitKind = HIT_CLEAR; return; }
     if (InRect(g_rSet, x, y))   { g_hitKind = HIT_SET;   return; }
     for (int i = 0; i < 5; ++i)
         if (InRect(g_rPreset[i], x, y)) { g_hitKind = HIT_PRESET; g_hitIdx = i; return; }
+}
+
+// ---------------------------------------------------------------- 时长输入框
+// 自绘 UI 里没有原生 EDIT，点「时长」时临时弹一个 300×120 的小窗，
+// 用的是和设置对话框一样的"注册窗口类 + 模态消息循环"写法。
+static HWND g_durEdit = nullptr;
+
+static LRESULT CALLBACK DurDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        HFONT f = CreateFontW(16,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei");
+        HWND lab = CreateWindowW(L"STATIC", L"这一项播放多少秒？（1–3600）", WS_CHILD|WS_VISIBLE,
+                                 16,14,260,20, h, nullptr, nullptr, nullptr);
+        wchar_t buf[16]; _snwprintf(buf,16,L"%d", g_uiDurSec);
+        g_durEdit = CreateWindowW(L"EDIT", buf, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_AUTOHSCROLL,
+                                  16,44,120,26, h, (HMENU)(INT_PTR)1, nullptr, nullptr);
+        HWND ok = CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,
+                                146,44,60,26, h, (HMENU)(INT_PTR)2, nullptr, nullptr);
+        HWND cancel = CreateWindowW(L"BUTTON", L"取消", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+                                    212,44,60,26, h, (HMENU)(INT_PTR)3, nullptr, nullptr);
+        SendMessageW(lab, WM_SETFONT, (WPARAM)f, TRUE);
+        SendMessageW(g_durEdit, WM_SETFONT, (WPARAM)f, TRUE);
+        SendMessageW(ok, WM_SETFONT, (WPARAM)f, TRUE);
+        SendMessageW(cancel, WM_SETFONT, (WPARAM)f, TRUE);
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == 2) {
+            wchar_t buf[16]; GetWindowTextW(g_durEdit, buf, 16);
+            int v = _wtoi(buf);
+            if (v < 1) v = 1;
+            if (v > 3600) v = 3600;
+            g_uiDurSec = v;
+            DestroyWindow(h);
+        } else if (LOWORD(wp) == 3) {
+            DestroyWindow(h);
+        }
+        return 0;
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    }
+    return DefWindowProc(h, msg, wp, lp);
+}
+
+static void ShowDurationDialog(HWND parent) {
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc = {}; wc.cbSize = sizeof(wc); wc.lpfnWndProc = DurDlgProc;
+        wc.hInstance = GetModuleHandle(nullptr); wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1); wc.lpszClassName = L"MTHDurDlg";
+        RegisterClassExW(&wc); reg = true;
+    }
+    HWND dlg = CreateWindowExW(WS_EX_TOOLWINDOW, L"MTHDurDlg", L"时长",
+                               WS_POPUP|WS_CAPTION|WS_SYSMENU, 100,100,300,120,
+                               parent, nullptr, GetModuleHandle(nullptr), nullptr);
+    if (!dlg) return;
+    RECT rp, rd; GetWindowRect(parent,&rp); GetWindowRect(dlg,&rd);
+    SetWindowPos(dlg, nullptr, rp.left+(rp.right-rp.left)/2-(rd.right-rd.left)/2,
+                 rp.top+(rp.bottom-rp.top)/2-(rd.bottom-rd.top)/2, 0,0, SWP_NOSIZE|SWP_NOZORDER);
+    ShowWindow(dlg, SW_SHOW);
+    SetFocus(g_durEdit);
+    EnableWindow(parent, FALSE);
+    MSG msg;
+    while (IsWindow(dlg) && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (!IsDialogMessageW(dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
+    EnableWindow(parent, TRUE);
+    SetForegroundWindow(parent);
+    InvalidateRect(parent, nullptr, FALSE);
 }
 
 static void UiClick(int x, int y) {
@@ -5245,13 +5345,9 @@ static void UiClick(int x, int y) {
             g_blendOpacity = t;
         }
         break;
-    case HIT_DUR: {
-        static const int seq[] = { 15, 20, 30, 45, 60, 90 };
-        int n = (int)(sizeof(seq)/sizeof(seq[0])), i = 0;
-        for (; i < n; ++i) if (seq[i] == g_uiDurSec) break;
-        g_uiDurSec = seq[(i + 1) % n];
+    case HIT_DUR:
+        ShowDurationDialog(g_hwnd);   // 任意秒数，不再是固定几档
         break;
-    }
     case HIT_SET: ShowSettingsDialog(g_hwnd); break;
     case HIT_PRESET: PresetLoad(g_hitIdx); break;
     default: break;
@@ -5320,7 +5416,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             PresetsLoadFromFile();UpdatePresetButtons();SetTimer(hwnd,TIMER_MAIN,16,nullptr);
             wchar_t st[128];_snwprintf(st,128,L"就绪 — %d 个效果 · BPM %.0f",g_effectCount,g_bpm);UiStatus(st);
             return 0;}
-        if(wParam==TIMER_MAIN){UpdateBeat();ThumbPump(1);return 0;}
+        if(wParam==TIMER_MAIN){UpdateBeat();ThumbPump(1);
+            if (g_uiHoldClear) InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;}
         if(wParam==TIMER_CLEAR_HOLD && g_holdingClear){
             if(GetTickCount()-g_holdStartTick >= CLEAR_HOLD_MS){
                 g_holdingClear=false; g_holdCompleted=true; KillTimer(hwnd,TIMER_CLEAR_HOLD);
@@ -5365,7 +5463,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_LBUTTONDOWN: {
         int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
+        RECT rc; GetClientRect(hwnd, &rc);
+        UiBuild(rc.right, rc.bottom);
+        UiHitTest(x, y);
+        if (g_hitKind == HIT_CLEAR) {          // 清空按钮走"长按 1 秒"，不即时生效
+            g_uiHoldClear = true; g_uiHoldTick = GetTickCount();
+            SetCapture(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         UiClick(x, y);
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        if (g_uiHoldClear) {
+            DWORD el = GetTickCount() - g_uiHoldTick;
+            g_uiHoldClear = false;
+            ReleaseCapture();
+            if (el >= 1000) ClearPlaylist();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         return 0;
     }
 
