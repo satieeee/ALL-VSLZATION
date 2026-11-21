@@ -51,7 +51,7 @@ void glitchDisplace(int m,float r,float theta,float t,float sp,
 }
 
 vec3 mapGlitchColor(int cs,float pat,float r,float theta,float t,float phase){
-    float p=abs(pat);if(p<0.42)return uDarkBg>0?vec3(0.0):vec3(1.0);
+    float p=abs(pat);if(p<0.42)return audioGrade(uDarkBg>0?vec3(0.0):vec3(1.0));   // 音频颜色调制：能量亮度 + 频段染色 + 鼓点闪光
     float T0=0.42,T1=0.56,T2=0.70,T3=0.84,T4=0.96,brightness;
     if(p<T1)brightness=(p-T0)/(T1-T0)*0.35;else if(p<T2)brightness=0.35+(p-T1)/(T2-T1)*0.35;
     else if(p<T3)brightness=0.70+(p-T2)/(T3-T2)*0.20;else if(p<T4)brightness=0.90+(p-T3)/(T4-T3)*0.08;
@@ -64,7 +64,7 @@ vec3 mapGlitchColor(int cs,float pat,float r,float theta,float t,float phase){
     else if(cs==3){hue=3.0+brightness*50.0+bp*10.0;sat=brightness*0.6+0.1;}
     else if(cs==4){hue=mod(310.0+brightness*100.0+r*10.0+t*20.0*sp,360.0);sat=brightness*0.55+0.1;}
     else if(cs==5){hue=mod(theta*360.0+r*180.0+sin(uTime*0.15)*15.0+phase*40.0,360.0);sat=brightness*0.55+0.1;}
-    return hsl2rgb(hue,clamp(sat,0.0,1.0),clamp(light,0.0,1.0));
+    return audioGrade(hsl2rgb(hue,clamp(sat,0.0,1.0),clamp(light,0.0,1.0)));   // 音频颜色调制：能量亮度 + 频段染色 + 鼓点闪光
 }
 
 void main(){
@@ -75,7 +75,7 @@ void main(){
     if(mod(wi,2.0)>=1.0)tw=wA-tw;
     float theta=tw/wA;
 
-    float sp=uSpeed,speed=uBpm/120.0*sp;
+    float speed=uBpm/120.0;
     float dr,dt,rDispR,rDispB;
     if(uFormBlend<=0.0){dr=r;dt=theta;rDispR=0;rDispB=0;glitchDisplace(uForm,r,theta,uTime,speed,dr,dt,rDispR,rDispB);}
     else if(uFormBlend>=1.0){dr=r;dt=theta;rDispR=0;rDispB=0;glitchDisplace(uFormB,r,theta,uTime,speed,dr,dt,rDispR,rDispB);}
@@ -88,38 +88,31 @@ void main(){
         rDispR=rR1*(1.0-sb)+rR2*sb;rDispB=rB1*(1.0-sb)+rB2*sb;
     }
 
+    // === 音频驱动（与 CPU RenderChunk 1:1） ===
+    theta += audioWave(uTime * 8.0 + r * 0.5, 0.05);     // 波形抖动 θ（弱）
+    dt += audioWave(uTime * 8.0 + r * 0.5, 0.05);         // 位移后 θ 同样抖动
+    float tAudio = uTime * 0.85 + uAudioPhase;       // 高频驱动细节转速（弱）
+    float audioAmp = audioPump(0.2);                       // 低频泵幅度（更弱）
+
     float pat;
     vec3 col;
     if(abs(rDispR)>0.0005||abs(rDispB)>0.0005){
-        float pR=basePattern(r+rDispR,theta,uTime,speed);
-        float pG=basePattern(r,theta,uTime,speed);
-        float pB=basePattern(r+rDispB,theta,uTime,speed);
+        float pR=basePattern(r+rDispR,theta,tAudio,speed);
+        float pG=basePattern(r,theta,tAudio,speed);
+        float pB=basePattern(r+rDispB,theta,tAudio,speed);
         vec3 cR=mapGlitchColor(uColorScheme,pR,r+rDispR,theta,uTime,uBeatPhase);
         vec3 cG=mapGlitchColor(uColorScheme,pG,r,theta,uTime,uBeatPhase);
         vec3 cB=mapGlitchColor(uColorScheme,pB,r+rDispB,theta,uTime,uBeatPhase);
         col=vec3(cR.r,cG.g,cB.b);
-        pat=(pR+pG+pB)/3.0;
+        pat=(pR+pG+pB)/3.0*audioAmp;
     }else{
-        pat=basePattern(dr,dt,uTime,speed);
+        pat=basePattern(dr,dt,tAudio,speed)*audioAmp;
         col=mapGlitchColor(uColorScheme,pat,dr,dt,uTime,uBeatPhase);
     }
 
     // === Pass 1 编码：R=pattern, GBA=颜色 ===
-    if(uEncode>0){fragColor=vec4(pat*0.5+0.5,col);return;}
-
-    // === Pass 2 跨效果 morphing（匹配 CPU TransitionEngine）===
-    if(uMorphBlend>0.0&&uMorphBlend<1.0){
-        vec2 tuv=gl_FragCoord.xy/uResolution;
-        vec4 oldEnc=texture(uOldEncoded,tuv);
-        float oldPat=oldEnc.r*2.0-1.0;
-        vec3 oldCol=oldEnc.gba;
-        float sb=uMorphBlend*uMorphBlend*(3.0-2.0*uMorphBlend);
-        float blendedPat=oldPat*(1.0-sb)+pat*sb;
-        vec3 newCol=mapGlitchColor(uColorScheme,blendedPat,dr,dt,uTime,uBeatPhase);
-        col=mix(oldCol,newCol,sb);
-    }
-
-    // === GDI HALFTONE 模拟：边缘色散 ===
+// === Pass 2 跨效果 morphing（匹配 CPU TransitionEngine）===
+// === GDI HALFTONE 模拟：边缘色散 ===
     // GDI SetStretchBltMode(HALFTONE) 低分辨率→全屏拉伸时
     // 对 RGB 三通道独立做 dither，高对比边缘处自然产生品红/紫色偏
     // 这里检测图案梯度，在梯度大的区域对各通道做微小扰动来模拟

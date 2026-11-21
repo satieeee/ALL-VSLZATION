@@ -22,7 +22,7 @@ float heightField(int f,float r,float theta,float t,float speed){
     float a=theta*TAU;
     switch(f){
     case 0:return sin(r*6.0+t*0.3*speed)*0.5+sin(r*14.0-t*0.2*speed)*0.28+cos(r*22.0)*0.12;
-    case 1:return sin(r*7.0+t*0.4*speed)*cos(a*4.0-t*0.35*speed)*0.5+sin(r*10.0-a*7.0+sin(uTime*0.2*uSpeed)*speed)*0.25;
+    case 1:return sin(r*7.0+t*0.4*speed)*cos(a*4.0-t*0.35*speed)*0.5+sin(r*10.0-a*7.0+sin(uTime*0.2)*speed)*0.25;
     case 2:{float ba=floor(a*5.0/PI),br=floor(r*4.0);float h=sin(ba*127.1+br*311.7+t*0.7*speed)*0.55+sin(ba*269.5+br*183.3-t*0.5*speed)*0.35;return h+sin(r*4.0+t*0.3*speed)*0.1;}
     case 3:return sin(r*8.0+t*0.5*speed)*0.55+cos(r*16.0-t*0.3*speed)*0.25;
     case 4:return sin(r*6.0+t*0.3*speed)*sin(a*5.0+t*0.25*speed)*0.6+cos(r*12.0)*cos(a*10.0)*0.18;
@@ -40,7 +40,7 @@ vec3 shade(int cs,float h,float nr,float nt,float nz,float phase){
     if(cs==0)hue=215.0+h*15.0+bp*8.0;else if(cs==1)hue=185.0+h*20.0+bp*10.0;
     else if(cs==2)hue=240.0+h*12.0+bp*5.0;else if(cs==3)hue=200.0+h*18.0+bp*7.0;
     else if(cs==4)hue=160.0+h*25.0+bp*10.0;else hue=250.0+h*15.0+bp*6.0;
-    return hsl2rgb(hue,sat,light);
+    return audioGrade(hsl2rgb(hue,sat,light));
 }
 
 void main(){
@@ -51,7 +51,7 @@ void main(){
     if(mod(wi,2.0)>=1.0)tw=wA-tw;
     float theta=tw/wA,r0=r;
 
-    float speed=uBpm/120.0*uSpeed,spd=speed;
+    float speed=uBpm/120.0,spd=speed;
     float a=theta*TAU;
     switch(uProjection){
     case 0:break;case 1:{float spin=r*1.5,ang=a+spin+sin(uTime*0.3)*spd*0.3;r=clamp(r+sin(ang*2.0+sin(uTime*0.5)*spd)*0.01,0.0,1.0);theta=mod(ang/TAU,1.0);break;}
@@ -61,29 +61,21 @@ void main(){
     case 5:{float d=(r+a*0.1)*0.7,e=(r-a*0.1)*0.7;r=clamp(d+sin(e*3.5+sin(uTime*0.5)*spd)*0.04,0.0,1.0);theta=(e+cos(d*4.5-sin(uTime*0.35)*spd)*0.03)/TAU;break;}
     }
 
-    float h0,sb;if(uFormBlend<=0.0){h0=heightField(uForm,r,theta,uTime,speed);sb=0.0;}else if(uFormBlend>=1.0){h0=heightField(uFormB,r,theta,uTime,speed);sb=1.0;}else{sb=uFormBlend*uFormBlend*(3.0-2.0*uFormBlend);h0=heightField(uForm,r,theta,uTime,speed)*(1.0-sb)+heightField(uFormB,r,theta,uTime,speed)*sb;}
-    float hr0=heightField(uForm,clamp(r+EPS_R,0.0,1.5),theta,uTime,speed),hrB=heightField(uFormB,clamp(r+EPS_R,0.0,1.5),theta,uTime,speed);
+    // === 音频驱动（与 CPU RenderChunk 1:1） ===
+    theta += audioWave(uTime * 8.0, 0.05);           // 波形抖动 θ（弱）
+    float tAudio = uTime * 0.85 + uAudioPhase;  // 高频驱动细节转速（弱）
+    float audioAmp = audioPump(0.2);                 // 低频泵幅度（更弱）
+
+    float h0,sb;if(uFormBlend<=0.0){h0=heightField(uForm,r,theta,tAudio,speed);sb=0.0;}else if(uFormBlend>=1.0){h0=heightField(uFormB,r,theta,tAudio,speed);sb=1.0;}else{sb=uFormBlend*uFormBlend*(3.0-2.0*uFormBlend);h0=heightField(uForm,r,theta,tAudio,speed)*(1.0-sb)+heightField(uFormB,r,theta,tAudio,speed)*sb;}
+    float hr0=heightField(uForm,clamp(r+EPS_R,0.0,1.5),theta,tAudio,speed),hrB=heightField(uFormB,clamp(r+EPS_R,0.0,1.5),theta,tAudio,speed);
     float hr=mix(hr0,hrB,sb);
-    float ht0=heightField(uForm,r,clamp(theta+EPS_T,0.0,1.0),uTime,speed),htB=heightField(uFormB,r,clamp(theta+EPS_T,0.0,1.0),uTime,speed);
+    float ht0=heightField(uForm,r,clamp(theta+EPS_T,0.0,1.0),tAudio,speed),htB=heightField(uFormB,r,clamp(theta+EPS_T,0.0,1.0),tAudio,speed);
     float ht=mix(ht0,htB,sb);
     float nr=-(hr-h0)/EPS_R,nt=-(ht-h0)/(EPS_T*(r0+0.01)),nz=1.0,nLen=sqrt(nr*nr+nt*nt+nz*nz);
-    vec3 col=shade(uColorScheme,h0,nr/nLen,nt/nLen,nz/nLen,uBeatPhase);
+    vec3 col=shade(uColorScheme,h0*audioAmp,nr/nLen,nt/nLen,nz/nLen,uBeatPhase); // 只泵高度，不动法线
 
     // === Pass 1 编码：R=heightField, GBA=颜色 ===
-    if(uEncode>0){fragColor=vec4(h0*0.5+0.5,col);return;}
-
-    // === Pass 2 跨效果 morphing（匹配 CPU TransitionEngine）===
-    if(uMorphBlend>0.0&&uMorphBlend<1.0){
-        vec2 tuv=gl_FragCoord.xy/uResolution;
-        vec4 oldEnc=texture(uOldEncoded,tuv);
-        float oldPat=oldEnc.r*2.0-1.0;
-        vec3 oldCol=oldEnc.gba;
-        float sb=uMorphBlend*uMorphBlend*(3.0-2.0*uMorphBlend);
-        float blendedPat=oldPat*(1.0-sb)+h0*sb;
-        vec3 newCol=shade(uColorScheme,blendedPat,nr/nLen,nt/nLen,nz/nLen,uBeatPhase);
-        col=mix(oldCol,newCol,sb);
-    }
-
-    col=cpuFinalize(col,gl_FragCoord.xy,uDitherStrength);
+// === Pass 2 跨效果 morphing（匹配 CPU TransitionEngine）===
+col=cpuFinalize(col,gl_FragCoord.xy,uDitherStrength);
     fragColor=vec4(col,uOpacity);
 }

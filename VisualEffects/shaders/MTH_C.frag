@@ -59,8 +59,8 @@ float evalForm(int f, vec2 p) {
     else if(uProjection==1){ tx*=(1.0-TWIST*0.3); ty*=(1.0-TWIST*0.3); }
     else if(uProjection==2){ tx+=TWIST*sin(ty*FREQ_LOW*4.0); ty+=TWIST*sin(tx*FREQ_HIGH*4.0); }
     else if(uProjection==3){ tx=tx*ty; }
-    tx+=TWIST*sin(ty*FREQ_LOW*8.0+1.3+uTime*uBpm/240.0*uSpeed);
-    ty+=TWIST*cos(tx*FREQ_HIGH*7.0-0.7+uTime*uBpm/240.0*uSpeed);
+    tx+=TWIST*sin(ty*FREQ_LOW*8.0+1.3+uTime*uBpm/240.0);
+    ty+=TWIST*cos(tx*FREQ_HIGH*7.0-0.7+uTime*uBpm/240.0);
     if(f==0)      return tx*tx+0.6*ty*ty+0.4*tx*ty+0.25*tx-0.15*ty-0.20;
     else if(f==1) return tx*tx*tx+0.8*ty*ty*ty+0.5*tx*ty+0.3*tx-0.18;
     else if(f==2){ float r2=tx*tx+ty*ty; return r2*r2-0.5*tx*r2-0.06*ty*ty+0.06*tx; }
@@ -84,7 +84,7 @@ vec3 mapColor(float pattern) {
     float hue=hueBase+pattern*30.0;
     float sat=mix(0.10,0.85,fract(pattern*2.7));
     float lig=mix(0.05,0.95,0.5+0.5*sin(pattern*4.0));
-    return hsl2rgb(hue,sat,lig);
+    return audioGrade(hsl2rgb(hue,sat,lig));   // 音频颜色调制：能量亮度 + 频段染色 + 鼓点闪光（与 CPU MapToColor 1:1）
 }
 
 void main(){
@@ -112,6 +112,10 @@ void main(){
     float n=fbm(np);
     v1+=(n-0.5)*FRACTAL_DIM;
 
+    // 音频驱动（与 CPU RenderChunk 1:1）：低频泵幅度调制最终图案标量
+    float audioAmp = audioPump(0.2);
+    v1 *= audioAmp;
+
     // 线条渲染（管状高光）
     float d1=abs(v1), d2=abs(v2);
     float line1=smoothstep(THICKNESS+SHARPNESS*0.1, THICKNESS-SHARPNESS*0.1, d1);
@@ -129,18 +133,6 @@ void main(){
 
     // 跨效果 morphing（图案级混合）
     float pat=clamp(v1,-1.0,1.0);
-    if(uEncode>0){ fragColor=vec4(pat*0.5+0.5,col); return; }
-    if(uMorphBlend>0.0 && uMorphBlend<1.0){
-        vec2 tuv=gl_FragCoord.xy/uResolution;
-        vec4 oldEnc=texture(uOldEncoded,tuv);
-        float oldPat=oldEnc.r*2.0-1.0;
-        vec3 oldCol=oldEnc.gba;
-        float sb=uMorphBlend*uMorphBlend*(3.0-2.0*uMorphBlend);
-        float blendedPat=oldPat*(1.0-sb)+pat*sb;
-        vec3 newCol=mix(bg,mapColor(blendedPat),shade);
-        col=mix(oldCol,newCol,sb);
-    }
-
-    col=cpuFinalize(col, gl_FragCoord.xy, uDitherStrength);
+col=cpuFinalize(col, gl_FragCoord.xy, uDitherStrength);
     fragColor=vec4(col, shade);  // alpha=线条掩码：背景透明、线条不透明
 }

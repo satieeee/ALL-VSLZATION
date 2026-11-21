@@ -1,6 +1,10 @@
 @echo off
-set "PROJ=D:\C++ prog\ALL VSLZATION"
+set "PROJ=D:\C++ prog\ALL VSLZATION V2"
 cd /d "%PROJ%"
+
+rem 编译前先关掉可能在跑的 MAIN.exe。它锁着 out\MAIN.exe，链接会以 LNK1104 失败，
+rem 而失败之后 exe 会停在旧版本甚至被删掉 —— 表现出来就是"明明改了、跑起来还是老样子"。
+taskkill /IM MAIN.exe /F >nul 2>&1
 
 echo [1/4] Setting up VS build environment...
 call "D:\C++\VC\Auxiliary\Build\vcvars64.bat"

@@ -1,0 +1,18 @@
+# 构建产物
+out/
+*.obj
+*.pdb
+*.ilk
+*.lib
+
+# 本地设置 / 个人数据
+.claude/
+presets.dat
+
+# 开发过程截图
+_图片归档/
+
+# 运行期自动生成的诊断文件
+ss_build.txt
+load_report.txt
+C3_shader_log.txt

@@ -2,6 +2,7 @@
 
 #define NOMINMAX
 #include <windows.h>
+#include "AudioCapture/AudioAnalyzer.h"
 
 /**
  * @brief 可视化效果抽象接口
@@ -41,8 +42,17 @@ public:
     /// 默认空实现，需要 BPM 驱动的效果自行重写
     virtual void SyncBeatState(float /*bpm*/, float /*phase*/, bool /*triggered*/) {}
 
+    /// 每帧同步音频分析结果（频谱/波形/能量包络/对拍相位）。
+    /// 默认空实现 = 忽略音频，旧效果行为不变。
+    virtual void SetAudio(const AudioFrame& /*af*/) {}
+
     /// 设置用户手动速度倍率（1.0 = 正常，0.5 = 半速，2.0 = 双速）
     virtual void SetUserSpeed(float /*multiplier*/) {}
+
+    /// 出场计时（秒）。项目时长到了、正在等下一次鼓点切走时，播放链会从 0 开始递增；
+    /// 不处于待切出状态时给一个很大的值。默认空实现 = 该效果没有出场动画。
+    /// 语义与 GPU 侧 main.cpp 的 g_plExitT / shader 的 uExitTime 一致。
+    virtual void SetExitTime(float /*seconds*/) {}
 
     /// 设置黑底/白底模式（true=黑底, false=白底）
     virtual void SetDarkMode(bool) {}

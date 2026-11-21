@@ -163,7 +163,8 @@ vec3 mapColor(int cs, float pattern, float r, float theta, float phase) {
         }
         sat=clamp(sat,0.0,1.0); light=clamp(light,0.0,1.0);
         vec3 col = hsl2rgb(hue,sat,light);
-        return mix(uDarkBg>0?vec3(0.0):vec3(1.0), col, w);
+        col = mix(uDarkBg>0?vec3(0.0):vec3(1.0), col, w);
+        return audioGrade(col);   // 音频颜色调制：能量亮度 + 频段染色 + 鼓点闪光
     }
     else if (p<T1) brightness=(p-T0)/(T1-T0)*0.30;
     else if (p<T2) brightness=0.30+(p-T1)/(T2-T1)*0.35;
@@ -183,7 +184,7 @@ vec3 mapColor(int cs, float pattern, float r, float theta, float phase) {
     case 5: hue=mod(theta*360.0+sin(uTime*0.15)*15.0+phase*40.0, 360.0); sat=brightness*0.80+0.10; light=0.90-brightness*0.18; break;
     }
     sat=clamp(sat,0.0,1.0); light=clamp(light,0.0,1.0);
-    return hsl2rgb(hue,sat,light);
+    return audioGrade(hsl2rgb(hue,sat,light));   // 音频颜色调制：能量亮度 + 频段染色 + 鼓点闪光
 }
 
 void main() {
@@ -195,44 +196,32 @@ void main() {
     float r = uv.x;
     float theta = uv.y;
 
-    float speed = uBpm / 120.0 * uSpeed;
+    float speed = uBpm / 120.0;
     mapProjection(uProjection, r, theta, speed);
 
+    // === 音频驱动（与 CPU RenderChunk 1:1） ===
+    theta += audioWave(uTime * 8.0 + r * 0.5, 0.05);       // 波形抖动 θ（弱）
+    float tAudio = uTime * 0.85 + uAudioPhase;         // 高频驱动细节转速（弱）
+    float audioAmp = audioPump(0.2);                         // 低频泵幅度（更弱）
+
     float pat;
-    if (uFormBlend <= 0.0) pat = evalForm(uForm, r, theta, uTime, speed);
-    else if (uFormBlend >= 1.0) pat = evalForm(uFormB, r, theta, uTime, speed);
+    if (uFormBlend <= 0.0) pat = evalForm(uForm, r, theta, tAudio, speed);
+    else if (uFormBlend >= 1.0) pat = evalForm(uFormB, r, theta, tAudio, speed);
     else { float sb = uFormBlend*uFormBlend*(3.0-2.0*uFormBlend);
-        pat = evalForm(uForm, r, theta, uTime, speed)*(1.0-sb)
-            + evalForm(uFormB, r, theta, uTime, speed)*sb; }
+        pat = evalForm(uForm, r, theta, tAudio, speed)*(1.0-sb)
+            + evalForm(uFormB, r, theta, tAudio, speed)*sb; }
+    pat *= audioAmp;
 
     // 提前计算颜色（CPU版 TransitionEngine 在 encode/morph 之前就有 col）
     vec3 col = mapColor(uColorScheme, pat, r, theta, uBeatPhase);
 
     // === Pass 1 编码：存储旧效果的 图案+颜色 到 FBO ===
     // R=pattern[0,1], GBA=oldColor
-    if (uEncode > 0) {
-        fragColor = vec4(pat*0.5+0.5, col);
-        return;
-    }
-
-    // === Pass 2 跨效果 morphing：匹配 CPU TransitionEngine 逻辑 ===
+// === Pass 2 跨效果 morphing：匹配 CPU TransitionEngine 逻辑 ===
     // CPU: blendedPat=oldPat*(1-t)+newPat*t
     //      oldCol=oldEffect.MapToColor(blendedPat)
     //      newCol=newEffect.MapToColor(blendedPat)
     //      pixel=LerpRGBA(oldCol,newCol,t)
-    if (uMorphBlend > 0.0 && uMorphBlend < 1.0) {
-        vec2 tuv = gl_FragCoord.xy / uResolution;
-        vec4 oldEnc = texture(uOldEncoded, tuv);
-        float oldPat = oldEnc.r * 2.0 - 1.0;   // 解码旧图案
-        vec3 oldCol = oldEnc.gba;               // 旧效果的颜色
-        float sb = uMorphBlend * uMorphBlend * (3.0 - 2.0 * uMorphBlend);
-        // 图案场层面混合
-        float blendedPat = oldPat * (1.0 - sb) + pat * sb;
-        // 混合后的图案走新效果的调色板
-        vec3 newCol = mapColor(uColorScheme, blendedPat, r, theta, uBeatPhase);
-        col = mix(oldCol, newCol, sb);  // 混合后的图案走新调色板 + 颜色平滑过渡
-    }
-
-    col = cpuFinalize(col, gl_FragCoord.xy, uDitherStrength);
+        col = cpuFinalize(col, gl_FragCoord.xy, uDitherStrength);
     fragColor = vec4(col, uOpacity);
 }
