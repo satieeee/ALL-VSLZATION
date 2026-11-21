@@ -176,4 +176,6 @@ uniform float uFft[16]; uniform float uWave[];
 - 只支持 Windows（WASAPI 环回是 Windows 专有）
 - **播放窗口是置顶的**（`WS_EX_TOPMOST`）—— 它总是盖在别的窗口上面，不想让它挡着就按 Esc 关掉
 - 过渡动画是"等鼓点"的：**没有音乐时不会自动切下一个效果**（这是有意的，转场要踩在拍子上）
-- 部分效果依赖烘焙好的几何数据（`VisualEffects/M2|M3|M4/*Mesh.h`，体积占仓库 90%），这些是生成物，改不了也没必要改
+- 仓库体积的 **64%** 是四个烘焙几何数据文件（`M3Mesh.h` 18.1MB、`M4Mesh.h` 13.4MB、`M2Mesh.h` 11.1MB、`B376Field.h` 4.8MB，合计 47.4MB / 全工程 73.7MB）。它们只服务 **Metalheart1–4** 这 4 个效果，其余 35 个效果不碰。
+  里面是几千行顶点/索引/曲线查找表的字面量数组，由 `gen_mesh_effect.py` 从参考图离线生成 —— 手改没有意义，要换造型得换参考图重跑生成器。
+  **生成器没有随本仓库上传**，需要时从旧快照取：`ALL VSLZATION V1.2\effect reference\conclusion\gen_mesh_effect.py`。
