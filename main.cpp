@@ -3126,6 +3126,13 @@ static void PLUpdate(float dt, float bpm, float phase, bool beat) {
         g_plElapsed = 0; g_plBlurT = 0;
         g_plEffIdx[0] = EffectIndex(g_playlist[g_plIndex].name);
         g_plEffIdx[1] = g_playlist[g_plIndex].name2.empty() ? -1 : EffectIndex(g_playlist[g_plIndex].name2);
+        // 【同一效果重复 = 不做过场】只有一两个效果的播放链循环时，绕回自己照样会走 PL_BLUR：
+        // 把同一画面和它自己的新实例扭曲着交叉淡化 1.2 秒 —— 看起来就是整幅"淡绿透明的闪烁"
+        // （Hitpulse 这类调色板偏绿的效果尤其明显）。这里直接无缝续播：时间轴、调色板、
+        // 相机一概不重置，画面一个字都不动地继续跑；多效果轮播的过渡完全不受影响。
+        // 注：g_plOldEffIdx 只存了底层效果，name2 上层有变化时也跳过过渡 —— 上层本来就是
+        // 每帧叠加绘制，不需要过场。
+        if (g_plOldEffIdx == g_plEffIdx[0]) { g_plState = PL_PLAYING; return; }
         // 旧效果【从这一刻起】开始飞出；新效果不飞出。下一个效果相同则不播飞出（同 GPU 旧判据）。
         g_plOldExitT = (g_plOldEffIdx == g_plEffIdx[0]) ? 999.0f : 0.0f;
         g_plOldTime = g_plTime; g_plTime = 0; g_plExitT = 999.0f; g_b376FlowPhase = 0.0f; g_audioPhase = 0.0f; g_hitDrive = 0.0f; g_hitFlow = g_hitFlowDrive = 0.0f; g_hitCycleT = -1.0f; g_prevHitKick = 0.0f; g_mdVb = g_mdVvb = g_mdVm = g_mdVvm = g_mdVt = g_mdVvt = 0.0f; g_mdQ28 = 0.0f; g_c3LayerPhase = 0.0f; g_pcPalIdx = 0; // 新效果时间归零（匹配 CPU new 对象 m_time=0）；调色板也回第一套
