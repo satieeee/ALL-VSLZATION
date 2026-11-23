@@ -4860,7 +4860,10 @@ static void UiBuild(int W, int H) {
     g_rDur   = { 400, kDockTop + 8, 500, kDockTop + 36 };
     g_rClear = { 508, kDockTop + 8, 588, kDockTop + 36 };
     for (int i = 0; i < 5; ++i) g_rPreset[i] = { 640 + i*44, kDockTop + 8, 676 + i*44, kDockTop + 36 };
-    g_rSet = { W - kMargin - 72, kDockTop + 8, W - kMargin, kDockTop + 36 };
+    // 【必须在窗口顶上，不能放 dock 里】dock 底色是整片 FillRectangle 刷的，
+    // 而 drawHeader()（也就是画这个按钮的地方）在 dock 之前调用 —— 放 dock 里会被盖掉，
+    // 变成"看不见但能点"的空洞。放顶部：drawHeader 在遮罩条之后画，天然可见。
+    g_rSet = { W - kMargin - 72, 16, W - kMargin, 44 };
 }
 
 // ============================================================================
