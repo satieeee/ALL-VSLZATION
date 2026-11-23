@@ -244,14 +244,13 @@ static const EffectDecl kEffectDecls[] = {
 
     // ---- 全屏 shader 的个别设定 ----
     { L"Psychedelic", EK_FRAG, -1, FAM_NORMAL, EIN_NONE, false, -1, -1, 1 },          // 用另一套投影
-    { L"Quicksilver", EK_FRAG, -1, FAM_NORMAL, EIN_NONE, false,  1 },                // 五阶段是一次建构，不参与每拍切形态
     { L"Azurite_c",   EK_FRAG, -1, FAM_NORMAL, EIN_NONE, false, -1,  4 },            // 初始形态 4
     { L"MTH_C",       EK_FRAG, -1, FAM_NORMAL, EIN_NONE, false,  5,  3 },            // 初始形态 3，共 5 形态
     { L"Cubeeffect1", EK_FRAG, -1, FAM_CUBE,   EIN_NONE, true,   2 },                // 双形态：白底墨线 / 黑底粘滴
     { L"Wormtunnel",  EK_FRAG, -1, FAM_3D,     EIN_NONE, false, -1 },                // 光线步进 SDF 隧道
 
-    // ---- Layers 族：layers.html 配方直接拼装的整屏 shader ----
-    // 归族只为在树里成组；渲染路径与 Normal 族一样，所以 DownscaleApplies（⅔ 降采样）
+    // ---- Layers 族：layers.html 配方拼装的整屏 shader（外加 4 个并进来的旧效果）----
+    // 归族只为在画廊里成组；渲染路径与 Normal 族一样，所以 DownscaleApplies（⅔ 降采样）
     // 和 EffIsMixable（随机播放的上下层混层）仍然放行 —— 这批 dens≈10 的重 shader
     // 正需要降采样保帧率，随机列表也靠它们凑混层。
     { L"Pulseblade",   EK_FRAG, -1, FAM_LAYERS }, { L"Indigoflare",  EK_FRAG, -1, FAM_LAYERS },
@@ -263,6 +262,11 @@ static const EffectDecl kEffectDecls[] = {
     // 鼓点触发的一对：H = max(uHitKick, uHitSnare*0.75)
     { L"Hitpetal",     EK_FRAG, -1, FAM_LAYERS },   // H 只调亮度（S1 的 mix 系数空转）
     { L"Hitpulse",     EK_FRAG, -1, FAM_LAYERS },   // H 接进 S1，鼓点改纹理形态
+    // 从 Normal 族并进来的 4 个：不是 layers.html 配方，只改了归族，其余设定保持原样
+    { L"Quicksilver", EK_FRAG, -1, FAM_LAYERS, EIN_NONE, false,  1 },   // 五阶段是一次建构，不参与每拍切形态
+    { L"QKnopic",     EK_FRAG, -1, FAM_LAYERS },
+    { L"Loxodrome",   EK_FRAG, -1, FAM_LAYERS },
+    { L"rollingsolarsystem", EK_FRAG, -1, FAM_LAYERS },
 };
 
 static const EffectDecl* FindEffectDecl(const wchar_t* n) {
