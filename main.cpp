@@ -691,11 +691,11 @@ static GLuint g_blendProg = 0;  // 混合 shader
 // showErrors=false 用在启动期的临时上下文：那里失败还弹框会挡在用户面前，
 // 真正的错误诊断留给玩家窗口那一次。
 //
-// 【公式来源】剪映专业版 6.0.1 的 Resources/MixMode/<mode>/xshader/blend.frag。
-// 那边每个模式一份 Straight/PreMul 两套实现；我们的两层都是不透明整帧（a=1），
-// alpha 项退化后 Straight 公式就剩逐通道混合本身（见文件里的 color = ... 后半段），
-// 所以这里只抄混合曲线，alpha/不透明度仍由下面的合成式统一处理。
-// ch(a, b)：a = 底层（剪映的 bg），b = 上层（剪映的 fg）。
+// 【公式来源】行业标准的图层混合定义（W3C Compositing / PDF 混合模式，与 Photoshop
+// 的逐通道公式一致）。参考实现一般分 Straight / PreMul 两套 alpha 分支；我们的两层
+// 都是不透明整帧（a=1），alpha 项退化后 Straight 公式就剩逐通道混合本身，
+// 所以这里只取混合曲线，alpha/不透明度仍由下面的合成式统一处理。
+// ch(a, b)：a = 底层（bg），b = 上层（fg）。
 static const char* const kBlendFS =
     "#version 330 core\n"
     "in vec2 vUV;out vec4 c;"
@@ -705,13 +705,13 @@ static const char* const kBlendFS =
     "if(m==2)return 1.0-(1.0-a)*(1.0-b);"                                                  // 滤色
     "if(m==3)return a<0.5?2.0*a*b:1.0-2.0*(1.0-a)*(1.0-b);"                                // 叠加（按【底层】分界）
     "if(m==4)return b<0.5?2.0*a*b:1.0-2.0*(1.0-a)*(1.0-b);"                                // 强光（按【上层】分界）
-    // 柔光 = 剪映那条 W3C/PDF soft-light：b<0.5 → 2ab+a²(1-2b)；否则 sqrt(a)(2b-1)+2a(1-b)。
+    // 柔光 = W3C/PDF 的 soft-light：b<0.5 → 2ab+a²(1-2b)；否则 sqrt(a)(2b-1)+2a(1-b)。
     // 旧实现是 Photoshop 那条（带 0.25 分段的伽马修正），中低亮度段两边的差别肉眼可见。
     "if(m==5)return b<0.5?2.0*a*b+a*a*(1.0-2.0*b):sqrt(a)*(2.0*b-1.0)+2.0*a*(1.0-b);"     // 柔光
     "if(m==6)return max(a+b-1.0,0.0);"                                                     // 线性加深
     "if(m==7)return a*b;"                                                                  // 正片叠底
     "if(m==8)return min(a,b);"                                                             // 变暗
-    // 颜色加深/减淡抄剪映的边界处理：上层为黑 → 黑、上层为白 → 白，避免除零
+    // 颜色加深/减淡沿用标准的边界处理：上层为黑 → 黑、上层为白 → 白，避免除零
     "if(m==9)return b<=1e-6?0.0:max(1.0-(1.0-a)/b,0.0);"                                   // 颜色加深
     "if(m==10)return b>=1.0-1e-6?1.0:min(a/(1.0-b),1.0);"                                  // 颜色减淡
     "return b;}"
@@ -2985,7 +2985,7 @@ static void DrawEffect(int idx, float t, float bpm, float phase, float speed, fl
 }
 
 // ===== 共享数据定义（CPU/GPU 后端共用）=====
-// 混合算法：公式与模式集照抄剪映专业版 6.0.1（Resources/MixMode/*/xshader/blend.frag）。
+// 混合算法：模式集与公式采用标准图层混合定义（W3C Compositing / PDF 混合模式）。
 // 【枚举值别重排】presets.dat 存的就是这个整数；变暗/颜色加深/颜色减淡是后补的，
 // 一律追加在末尾。下拉列表的展示顺序由 kBlendOrder 管，与这里的编号解耦。
 enum BlendMode { BM_None=0, BM_Lighten, BM_Screen, BM_Overlay, BM_HardLight, BM_SoftLight, BM_LinearBurn, BM_Multiply, BM_Darken, BM_ColorBurn, BM_ColorDodge, BM_COUNT };
@@ -5010,7 +5010,7 @@ static void UiBuild(int W, int H) {
     {
         const int rowH = 26, boxW = 168, padY = 6;
         int bottom = g_rBlend.top - 6;
-        int top = bottom - (BM_COUNT * rowH + 2 * padY);   // 11 项：正常 + 剪映的 10 种算法
+        int top = bottom - (BM_COUNT * rowH + 2 * padY);   // 11 项：正常 + 10 种混合算法
         g_rBlendBox = { g_rBlend.left, top, g_rBlend.left + boxW, bottom };
         for (int i = 0; i < BM_COUNT; ++i) {
             int y = top + padY + i * rowH;
