@@ -690,23 +690,43 @@ static GLuint g_blendProg = 0;  // 混合 shader
 // "播放时和主窗口里表现不一样"。
 // showErrors=false 用在启动期的临时上下文：那里失败还弹框会挡在用户面前，
 // 真正的错误诊断留给玩家窗口那一次。
+//
+// 【公式来源】剪映专业版 6.0.1 的 Resources/MixMode/<mode>/xshader/blend.frag。
+// 那边每个模式一份 Straight/PreMul 两套实现；我们的两层都是不透明整帧（a=1），
+// alpha 项退化后 Straight 公式就剩逐通道混合本身（见文件里的 color = ... 后半段），
+// 所以这里只抄混合曲线，alpha/不透明度仍由下面的合成式统一处理。
+// ch(a, b)：a = 底层（剪映的 bg），b = 上层（剪映的 fg）。
 static const char* const kBlendFS =
     "#version 330 core\n"
     "in vec2 vUV;out vec4 c;"
-    "uniform sampler2D uBase,uOverlay;uniform int uMode;uniform float uOpacity;"
+    "uniform sampler2D uBase,uOverlay;uniform int uMode;uniform float uOpacity;uniform int uKeyBg;"
     "float ch(float a,float b,int m){"
-    "if(m==1)return max(a,b);"
-    "if(m==2)return 1.0-(1.0-a)*(1.0-b);"
-    "if(m==3)return a<0.5?2.0*a*b:1.0-2.0*(1.0-a)*(1.0-b);"
-    "if(m==4)return b<0.5?2.0*a*b:1.0-2.0*(1.0-a)*(1.0-b);"
-    "if(m==5){if(b<0.5)return a-(1.0-2.0*b)*a*(1.0-a);else{float g=a<=0.25?((16.0*a-12.0)*a+4.0)*a:sqrt(a);return a+(2.0*b-1.0)*(g-a);}}"
-    "if(m==6)return a+b-1.0;"
-    "if(m==7)return a*b;"
+    "if(m==1)return max(a,b);"                                                             // 变亮
+    "if(m==2)return 1.0-(1.0-a)*(1.0-b);"                                                  // 滤色
+    "if(m==3)return a<0.5?2.0*a*b:1.0-2.0*(1.0-a)*(1.0-b);"                                // 叠加（按【底层】分界）
+    "if(m==4)return b<0.5?2.0*a*b:1.0-2.0*(1.0-a)*(1.0-b);"                                // 强光（按【上层】分界）
+    // 柔光 = 剪映那条 W3C/PDF soft-light：b<0.5 → 2ab+a²(1-2b)；否则 sqrt(a)(2b-1)+2a(1-b)。
+    // 旧实现是 Photoshop 那条（带 0.25 分段的伽马修正），中低亮度段两边的差别肉眼可见。
+    "if(m==5)return b<0.5?2.0*a*b+a*a*(1.0-2.0*b):sqrt(a)*(2.0*b-1.0)+2.0*a*(1.0-b);"     // 柔光
+    "if(m==6)return max(a+b-1.0,0.0);"                                                     // 线性加深
+    "if(m==7)return a*b;"                                                                  // 正片叠底
+    "if(m==8)return min(a,b);"                                                             // 变暗
+    // 颜色加深/减淡抄剪映的边界处理：上层为黑 → 黑、上层为白 → 白，避免除零
+    "if(m==9)return b<=1e-6?0.0:max(1.0-(1.0-a)/b,0.0);"                                   // 颜色加深
+    "if(m==10)return b>=1.0-1e-6?1.0:min(a/(1.0-b),1.0);"                                  // 颜色减淡
     "return b;}"
     "void main(){"
     "vec4 a=texture(uBase,vUV),b=texture(uOverlay,vUV);"
+    // ── 抠背景（默认开）：效果整帧都是不透明的，黑色/白色背景其实是"没有内容"。
+    // 黑底模式把纯黑↔近黑当背景抠掉，白底模式把纯白↔近白当背景抠掉，只让内容参与混合
+    // （否则正片叠底/叠加这类会把上层的黑底也乘进底层，整屏发暗）。
+    // 用 max 通道而不是亮度：深蓝、深红这类饱和小色块不该被当成黑背景抠掉。
+    // smoothstep 的 0→4% 是羽化带，抗锯齿边缘和轻微渐变不会出现硬边。
+    "float kf=1.0;"
+    "if(uKeyBg==1){kf=smoothstep(0.0,0.04,max(max(b.r,b.g),b.b));}"
+    "else if(uKeyBg==2){kf=smoothstep(0.0,0.04,1.0-min(min(b.r,b.g),b.b));}"
     "float mr=ch(a.r,b.r,uMode),mg=ch(a.g,b.g,uMode),mb=ch(a.b,b.b,uMode);"
-    "vec3 bl=clamp(vec3(mr,mg,mb),0.0,1.0);float eb=b.a*uOpacity;"
+    "vec3 bl=clamp(vec3(mr,mg,mb),0.0,1.0);float eb=b.a*uOpacity*kf;"
     "float onlyA=a.a*(1.0-eb);float onlyB=eb*(1.0-a.a);float both=a.a*eb;"
     "vec3 res=a.rgb*onlyA+b.rgb*onlyB+bl*both;float tot=onlyA+onlyB+both;"
     "c=vec4(a.rgb*(1.0-tot)+res,1.0);}";
@@ -2965,7 +2985,10 @@ static void DrawEffect(int idx, float t, float bpm, float phase, float speed, fl
 }
 
 // ===== 共享数据定义（CPU/GPU 后端共用）=====
-enum BlendMode { BM_None=0, BM_Lighten, BM_Screen, BM_Overlay, BM_HardLight, BM_SoftLight, BM_LinearBurn, BM_Multiply, BM_COUNT };
+// 混合算法：公式与模式集照抄剪映专业版 6.0.1（Resources/MixMode/*/xshader/blend.frag）。
+// 【枚举值别重排】presets.dat 存的就是这个整数；变暗/颜色加深/颜色减淡是后补的，
+// 一律追加在末尾。下拉列表的展示顺序由 kBlendOrder 管，与这里的编号解耦。
+enum BlendMode { BM_None=0, BM_Lighten, BM_Screen, BM_Overlay, BM_HardLight, BM_SoftLight, BM_LinearBurn, BM_Multiply, BM_Darken, BM_ColorBurn, BM_ColorDodge, BM_COUNT };
 
 struct PlaylistItem { std::wstring name, name2; BlendMode blendMode=BM_None; float opacity=1.0f; int durationSec=30; };
 
@@ -2986,6 +3009,9 @@ static const int PLAYER_DRAG_H = 32;
 // ===== 播放链 (GPU) =====
 static std::vector<PlaylistItem> g_playlist;
 static int g_plIndex = 0, g_plEffIdx[2] = {-1,-1}, g_plOldEffIdx = -1;
+// 过渡（PL_BLUR）期间"旧条目"在 g_playlist 里的序号。过渡里旧帧也要带上它自己的
+// 上层/混合/不透明度绘制，光有 g_plOldEffIdx（底层效果号）不够。
+static int g_plOldItemIdx = -1;
 static float g_plElapsed = 0, g_plBlurT = 0;
 enum PLState { PL_STOPPED, PL_PLAYING, PL_WAITBEAT, PL_BLUR };
 static PLState g_plState = PL_STOPPED;
@@ -3136,6 +3162,7 @@ static void PLUpdate(float dt, float bpm, float phase, bool beat) {
     }
     if (g_plState == PL_WAITBEAT && beat) {
         g_plOldEffIdx = g_plEffIdx[0]; // 保存旧效果
+        g_plOldItemIdx = g_plIndex;    // 旧条目序号（过渡里查它的上层/混合/不透明度）
         if (g_plIndex + 1 >= (int)g_playlist.size()) g_plIndex = 0;
         else g_plIndex++;
         g_plElapsed = 0; g_plBlurT = 0;
@@ -3501,6 +3528,63 @@ static bool DownscaleApplies() {
     return any;
 }
 
+/// 把一个播放链条目完整画到【当前绑定的帧缓冲】：底层效果 +（有上层时）按混合模式 /
+/// 不透明度 / 抠背景合成（Pass3 画在调用方当前的 FBO 上，返回时绑定不变）。
+/// PL_PLAYING 和跨效果过渡（PL_BLUR）共用它 —— 以前过渡分支只画底层：
+/// 切换后要等过渡跑完（1.2 秒）上层混合才"跳"出来，而且过渡一开始旧条目的上层会瞬间消失。
+static void DrawItemFrame(int effBase, int effOver, int blendMode, float itemOpacity,
+                          float t, float speed, int w, int h)
+{
+    if (effBase < 0) return;
+    if (effOver < 0 || itemOpacity <= 0.0f) {
+        DrawEffect(effBase, t, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg);
+        return;
+    }
+    if (g_blendProg) {
+        GLint savedFbo = 0;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &savedFbo);   // 合成阶段要画回这里（默认帧缓冲 / FboOld / FboNew）
+        EnsureFBO(w, h);
+        // Pass 1: 底层效果 → g_blendFbo
+        glBindFramebuffer(GL_FRAMEBUFFER, g_blendFbo);
+        glViewport(0, 0, w, h);
+        if (g_plBlackBg) { glClearColor(0.0f,0.0f,0.0f,1.0f); }
+        else             { glClearColor(1.0f,1.0f,1.0f,1.0f); }
+        glClear(GL_COLOR_BUFFER_BIT);
+        DrawEffect(effBase, t, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg, 1.0f);
+        // Pass 2: 上层效果 → g_oldFbo（全不透明度，由合成阶段控制）
+        glBindFramebuffer(GL_FRAMEBUFFER, g_oldFbo);
+        glViewport(0, 0, w, h);
+        if (g_plBlackBg) { glClearColor(0.0f,0.0f,0.0f,1.0f); }
+        else             { glClearColor(1.0f,1.0f,1.0f,1.0f); }
+        glClear(GL_COLOR_BUFFER_BIT);
+        DrawEffect(effOver, t, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg, 1.0f);
+        // Pass 3: 逐通道混合公式合成（正常(BM_None)也走这里：uMode=0 返回上层，由 uOpacity 做线性插值）
+        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)savedFbo);
+        glViewport(0, 0, w, h);
+        glUseProgram(g_blendProg);
+        glUniform1i(glGetUniformLocation(g_blendProg, "uMode"), blendMode);
+        glUniform1f(glGetUniformLocation(g_blendProg, "uOpacity"), itemOpacity);
+        // 抠背景跟着当前底色走：黑底抠黑、白底抠白（见 kBlendFS 里的 kf 计算）。
+        // 上层的 FBO 是用同一 g_plBlackBg 绘制的，背景色和这里天然一致。
+        glUniform1i(glGetUniformLocation(g_blendProg, "uKeyBg"), g_plBlackBg ? 1 : 2);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, g_blendTex);
+        glUniform1i(glGetUniformLocation(g_blendProg, "uBase"), 0);
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D, g_oldTex);
+        glUniform1i(glGetUniformLocation(g_blendProg, "uOverlay"), 1);
+        glBindVertexArray(g_vao);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+    } else {
+        // 退化路径：只在混合 shader 编译失败时走（简单 alpha 混合，不精确但别中断播放）
+        DrawEffect(effBase, t, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg, 1.0f);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        DrawEffect(effOver, t, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg, itemOpacity);
+        glDisable(GL_BLEND);
+    }
+}
+
 static void PLRender(HDC hdc, int w, int h) {
     float speed = g_plBpm / 120.0f * g_userSpeed;
 
@@ -3578,15 +3662,31 @@ static void PLRender(HDC hdc, int w, int h) {
                 const float savedExit = g_plExitT;
                 g_plExitT = g_effects[g_plOldEffIdx].isMesh ? g_plOldExitT : 999.0f;
 
+                // 旧条目：带上【它自己的】上层/混合/不透明度绘制。g_plOldItemIdx 是切项时
+                // 记下的序号；过渡中用户删掉/挪动了条目导致失效时，退回"只有底层"。
+                int oldOver = -1, oldBlend = 0; float oldOp = 1.0f;
+                if (g_plOldItemIdx >= 0 && g_plOldItemIdx < (int)g_playlist.size()) {
+                    const PlaylistItem& oi = g_playlist[g_plOldItemIdx];
+                    oldOver  = oi.name2.empty() ? -1 : EffectIndex(oi.name2);
+                    oldBlend = (int)oi.blendMode;
+                    oldOp    = oi.opacity;
+                }
                 glBindFramebuffer(GL_FRAMEBUFFER, TransitionFx::FboOld());
                 glViewport(0, 0, w, h);
                 glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
-                DrawEffect(g_plOldEffIdx, g_plOldTime, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg, 1.0f);
+                DrawItemFrame(g_plOldEffIdx, oldOver, oldBlend, oldOp, g_plOldTime, speed, w, h);
 
+                // 新条目：同样带混合。这样切换瞬间混合就已经在，扭曲淡化的是两个
+                // 各自完整的画面；否则要等过渡跑完 1.2 秒混合才"跳"出来。
+                int curBlend = 0; float curOp = 1.0f;
+                if (g_plIndex >= 0 && g_plIndex < (int)g_playlist.size()) {
+                    curBlend = (int)g_playlist[g_plIndex].blendMode;
+                    curOp    = g_playlist[g_plIndex].opacity;
+                }
                 glBindFramebuffer(GL_FRAMEBUFFER, TransitionFx::FboNew());
                 glViewport(0, 0, w, h);
                 glClearColor(0, 0, 0, 1); glClear(GL_COLOR_BUFFER_BIT);
-                DrawEffect(g_plEffIdx[0], g_plTime, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg, 1.0f);
+                DrawItemFrame(g_plEffIdx[0], g_plEffIdx[1], curBlend, curOp, g_plTime, speed, w, h);
 
                 g_plExitT = savedExit;
                 glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -3599,11 +3699,19 @@ static void PLRender(HDC hdc, int w, int h) {
                 tp.bass = g_af.bassAtt;
                 TransitionFx::Composite(w, h, g_plBlurT, tp);
             } else {
-                // 过渡资源建不起来时退化：直接画新效果，不中断播放
-                DrawEffect(g_plEffIdx[0], g_plTime, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg);
+                // 过渡资源建不起来时退化：直接画新效果（含混合），不中断播放
+                int curBlend = 0; float curOp = 1.0f;
+                if (g_plIndex >= 0 && g_plIndex < (int)g_playlist.size()) {
+                    curBlend = (int)g_playlist[g_plIndex].blendMode;
+                    curOp    = g_playlist[g_plIndex].opacity;
+                }
+                DrawItemFrame(g_plEffIdx[0], g_plEffIdx[1], curBlend, curOp, g_plTime, speed, w, h);
             }
         } else if (g_plEffIdx[0] >= 0) {
-            DrawEffect(g_plEffIdx[0], g_plTime, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg);
+            // 过渡的兜底（旧/新效果号缺失）：也走完整条目绘制，保证混合不缺席
+            const PlaylistItem& item = g_playlist[g_plIndex];
+            DrawItemFrame(g_plEffIdx[0], g_plEffIdx[1], (int)item.blendMode, item.opacity,
+                          g_plTime, speed, w, h);
         }
         if (DownscaleApplies()) DownscaleBlit(w, h);   // 只降 Normal 全屏效果；网格/Cube/Metalheart 全分辨率
         FeedbackWarp(w, h);
@@ -3612,53 +3720,10 @@ static void PLRender(HDC hdc, int w, int h) {
         return;
     }
     if (g_plState != PL_STOPPED && g_plEffIdx[0] >= 0) {
-        auto& item = g_playlist[g_plIndex];
-        float opacity = item.opacity;
-        if (g_plEffIdx[1] >= 0 && opacity > 0.0f) {
-            int blendMode = (int)item.blendMode;
-            // ── 7 种 Photoshop 混合模式路径（匹配 CPU PlaylistManager::Render）──
-            if (blendMode > 0 && g_blendProg) {
-                EnsureFBO(w, h);
-                // Pass 1: 底层效果 → g_blendFbo
-                glBindFramebuffer(GL_FRAMEBUFFER, g_blendFbo);
-                glViewport(0, 0, w, h);
-                if (g_plBlackBg) { glClearColor(0.0f,0.0f,0.0f,1.0f); }
-                else             { glClearColor(1.0f,1.0f,1.0f,1.0f); }
-                glClear(GL_COLOR_BUFFER_BIT);
-                DrawEffect(g_plEffIdx[0], g_plTime, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg, 1.0f);
-                glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                // Pass 2: 上层效果 → g_oldFbo（全不透明度，由合成阶段控制）
-                glBindFramebuffer(GL_FRAMEBUFFER, g_oldFbo);
-                glViewport(0, 0, w, h);
-                if (g_plBlackBg) { glClearColor(0.0f,0.0f,0.0f,1.0f); }
-                else             { glClearColor(1.0f,1.0f,1.0f,1.0f); }
-                glClear(GL_COLOR_BUFFER_BIT);
-                DrawEffect(g_plEffIdx[1], g_plTime, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg, 1.0f);
-                glBindFramebuffer(GL_FRAMEBUFFER, 0);
-                // Pass 3: 逐通道 Photoshop 公式合成（=CPU BlendChannel + opacity lerp）
-                glViewport(0, 0, w, h);
-                glUseProgram(g_blendProg);
-                glUniform1i(glGetUniformLocation(g_blendProg, "uMode"), blendMode);
-                glUniform1f(glGetUniformLocation(g_blendProg, "uOpacity"), opacity);
-                glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, g_blendTex);
-                glUniform1i(glGetUniformLocation(g_blendProg, "uBase"), 0);
-                glActiveTexture(GL_TEXTURE1);
-                glBindTexture(GL_TEXTURE_2D, g_oldTex);
-                glUniform1i(glGetUniformLocation(g_blendProg, "uOverlay"), 1);
-                glBindVertexArray(g_vao);
-                glDrawArrays(GL_TRIANGLES, 0, 6);
-            } else {
-                // 退化路径：简单 alpha 混合（blendMode==None 或 shader 不可用时）
-                DrawEffect(g_plEffIdx[0], g_plTime, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg, 1.0f);
-                glEnable(GL_BLEND);
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-                DrawEffect(g_plEffIdx[1], g_plTime, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg, opacity);
-                glDisable(GL_BLEND);
-            }
-        } else {
-            DrawEffect(g_plEffIdx[0], g_plTime, g_plBpm, g_plPhase, speed, (float)w, (float)h, g_plBlackBg);
-        }
+        // 混合语义 / 抠背景 / 退化路径都在 DrawItemFrame 里，与过渡共用同一份实现。
+        const PlaylistItem& item = g_playlist[g_plIndex];
+        DrawItemFrame(g_plEffIdx[0], g_plEffIdx[1], (int)item.blendMode, item.opacity,
+                      g_plTime, speed, w, h);
     } else {
         glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT);
     }
@@ -4372,7 +4437,7 @@ static void PresetsLoadFromFile() {
     while(fgetws(line,512,f)){if(wcsncmp(line,L"SLOT ",5)==0){cs=_wtoi(line+5);if(cs<0)cs=0;if(cs>4)cs=4;g_presets[cs].clear();}else if(cs>=0){PlaylistItem it;wchar_t*ctx=nullptr;wchar_t*tok=wcstok(line,L"|\n",&ctx);if(tok)it.name=tok;
         // 旧预设兼容：Cubeeffect3 已改名为 "Cubeeffect3 (dark)"，不映射的话旧 presets.dat 里
         // 这一项会因为 EffectIndex 精确匹配找不到而被丢掉。
-        if (it.name == L"Cubeeffect3") it.name = L"Cubeeffect3 (dark)";tok=wcstok(nullptr,L"|\n",&ctx);if(tok)it.name2=tok;tok=wcstok(nullptr,L"|\n",&ctx);if(tok)it.blendMode=(BlendMode)_wtoi(tok);tok=wcstok(nullptr,L"|\n",&ctx);if(tok)it.opacity=(float)_wtof(tok);tok=wcstok(nullptr,L"|\n",&ctx);if(tok)it.durationSec=_wtoi(tok);if(!it.name.empty()&&it.durationSec>0)g_presets[cs].push_back(it);}}
+        if (it.name == L"Cubeeffect3") it.name = L"Cubeeffect3 (dark)";tok=wcstok(nullptr,L"|\n",&ctx);if(tok)it.name2=tok;tok=wcstok(nullptr,L"|\n",&ctx);if(tok){int bm=_wtoi(tok);if(bm<0||bm>=BM_COUNT)bm=0;it.blendMode=(BlendMode)bm;}tok=wcstok(nullptr,L"|\n",&ctx);if(tok)it.opacity=(float)_wtof(tok);tok=wcstok(nullptr,L"|\n",&ctx);if(tok)it.durationSec=_wtoi(tok);if(!it.name.empty()&&it.durationSec>0)g_presets[cs].push_back(it);}}
     fclose(f);
 }
 static void PresetSave(int s) { g_presets[s]=g_playlist; PresetsSaveToFile(); wchar_t st[64];_snwprintf(st,64,L"  已存入预设%d（%d项）",s+1,(int)g_presets[s].size());UiStatus(st); }
@@ -4821,15 +4886,34 @@ static DWORD  g_uiHoldTick  = 0;
 // 不透明度轨道拖动中（按下 → 捕获鼠标 → 松开释放）
 static bool   g_uiDragOpacity = false;
 
+/// 不透明度滑块此刻编辑的是哪一条（-1 = 没有可编辑的条目）。
+/// 播放中一律是【正在播的那一条】：以前改的是 g_uiSelPl —— 开播时选中项往往不是
+/// 正在播的 0 号、甚至根本没选中（g_uiSelPl=-1，SetOpacityFromX 第一行就返回），
+/// 拖动看着"完全没反应"。停播后才退回选中的行（和「混合」下拉的口径一致）。
+static int OpacityTargetIndex() {
+    if (g_plState != PL_STOPPED && g_plIndex >= 0 && g_plIndex < (int)g_playlist.size())
+        return g_plIndex;
+    if (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size()) return g_uiSelPl;
+    return -1;
+}
+
 static RECT g_rChip[8];    static int g_chipFam[8];   static int g_nChip = 0;
 static RECT g_rRow[16];    static int g_nRow = 0;
 static int  g_rowPl[16] = {0};   // 每行对应播放链里的第几项
 static RECT g_rPlay, g_rStop, g_rBlend, g_rOpTrack, g_rDur, g_rClear, g_rSet, g_rPreset[5];
 // 混合模式下拉：点「混合」展开 8 个模式让用户挑，不再每点一次轮换下一个
 static bool g_uiBlendOpen = false;
-static RECT g_rBlendBox, g_rBlendItem[8];
-static const wchar_t* kBlendNames[8] = {
-    L"无混合", L"变亮", L"滤色", L"叠加", L"强光", L"柔光", L"线性加深", L"正片叠底"
+static RECT g_rBlendBox, g_rBlendItem[BM_COUNT];
+// 名字按 BlendMode 枚举值索引（presets.dat 里的数值直接对得上，不改）
+static const wchar_t* kBlendNames[BM_COUNT] = {
+    L"正常", L"变亮", L"滤色", L"叠加", L"强光", L"柔光", L"线性加深", L"正片叠底",
+    L"变暗", L"颜色加深", L"颜色减淡"
+};
+// 下拉列表的展示顺序（Photoshop 式：正常 → 变暗组 → 变亮组 → 对比组）。
+// 与枚举值解耦：点第 i 项写入的是 kBlendOrder[i]。
+static const BlendMode kBlendOrder[BM_COUNT] = {
+    BM_None, BM_Darken, BM_Multiply, BM_ColorBurn, BM_LinearBurn,
+    BM_Lighten, BM_Screen, BM_ColorDodge, BM_Overlay, BM_SoftLight, BM_HardLight
 };
 
 static const int  kMargin = 24, kGap = 12, kCols = 4, kCardH = 150;
@@ -4926,9 +5010,9 @@ static void UiBuild(int W, int H) {
     {
         const int rowH = 26, boxW = 168, padY = 6;
         int bottom = g_rBlend.top - 6;
-        int top = bottom - (8 * rowH + 2 * padY);
+        int top = bottom - (BM_COUNT * rowH + 2 * padY);   // 11 项：正常 + 剪映的 10 种算法
         g_rBlendBox = { g_rBlend.left, top, g_rBlend.left + boxW, bottom };
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < BM_COUNT; ++i) {
             int y = top + padY + i * rowH;
             g_rBlendItem[i] = { g_rBlend.left + 6, y, g_rBlend.left + boxW - 6, y + rowH };
         }
@@ -5236,10 +5320,17 @@ static void UiPaint(HDC hdc, int W, int H) {
             auto& it = g_playlist[pl];
             Gdiplus::RectF r((float)g_rRow[i].left, (float)g_rRow[i].top,
                              (float)(g_rRow[i].right-g_rRow[i].left), (float)(g_rRow[i].bottom-g_rRow[i].top));
-            bool sel   = (pl == g_uiSelPl);
+            bool sel     = (pl == g_uiSelPl);
+            bool playing = (g_plState != PL_STOPPED && pl == g_plIndex);   // 不透明度滑块编辑的正是这一条
             bool hover = (g_uiHoverKind == HIT_ROW && g_uiHoverIdx == i);
             FillRound(g, r, 8.f, (sel || hover) ? UIX::CARD2 : UIX::CARD);
             if (sel) { Gdiplus::SolidBrush ab(UIX::ACC); g.FillRectangle(&ab, r.X, r.Y + 8, 3.f, r.Height - 16); }
+            // 正在播的条目：右端一颗绿点（与效果画廊里"已编译"的标记同一套颜色），
+            // 一眼看出播放中拖动不透明度改的是谁 —— 即使选中的是别的行。
+            if (playing) {
+                Gdiplus::SolidBrush pb(Gdiplus::Color(255, 80, 230, 110));
+                g.FillEllipse(&pb, r.X + r.Width - 70.f, r.Y + r.Height*0.5f - 3.f, 6.f, 6.f);
+            }
             wchar_t idx[8]; _snwprintf(idx, 8, L"%02d", pl+1);
             Txt(g, idx, r.X + 14, r.Y, 40, r.Height, g_f10, sel ? UIX::ACC : UIX::DIM);
             Txt(g, it.name.c_str(), r.X + 52, r.Y + 1, r.Width - 220, 20, g_f13, UIX::TXT);
@@ -5284,7 +5375,7 @@ static void UiPaint(HDC hdc, int W, int H) {
 
         {   // 混合（单击展开下拉列表）
             int mode = (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size()) ? (int)g_playlist[g_uiSelPl].blendMode : 0;
-            if (mode < 0 || mode > 7) mode = 0;
+            if (mode < 0 || mode >= BM_COUNT) mode = 0;
             Gdiplus::RectF r((float)g_rBlend.left, (float)g_rBlend.top,
                              (float)(g_rBlend.right-g_rBlend.left), (float)(g_rBlend.bottom-g_rBlend.top));
             bool hovB = (g_uiHoverKind == HIT_BLEND);
@@ -5300,8 +5391,9 @@ static void UiPaint(HDC hdc, int W, int H) {
             g.FillPolygon(&cb, car, 3);
         }
 
-        {   // 不透明度
-            float op = (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size()) ? g_playlist[g_uiSelPl].opacity : 1.f;
+        {   // 不透明度（目标 = OpacityTargetIndex()：播放中就是正在播的那条，停播是选中行）
+            int ti = OpacityTargetIndex();
+            float op = (ti >= 0) ? g_playlist[ti].opacity : 1.f;
             Gdiplus::RectF tr((float)g_rOpTrack.left, (float)g_rOpTrack.top,
                               (float)(g_rOpTrack.right-g_rOpTrack.left), (float)(g_rOpTrack.bottom-g_rOpTrack.top));
             Txt(g, L"不透明度", tr.X - 70, tr.Y - 14, 64, 24, g_f10, UIX::DIM);
@@ -5321,7 +5413,7 @@ static void UiPaint(HDC hdc, int W, int H) {
                                   (float)(r.right - r.left), (float)(r.bottom - r.top));
         };
         int mode = (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size()) ? (int)g_playlist[g_uiSelPl].blendMode : 0;
-        if (mode < 0 || mode > 7) mode = 0;
+        if (mode < 0 || mode >= BM_COUNT) mode = 0;
         // 一圈放大 3px 的半透明框当阴影（GDI+ 没有真阴影），和下面的内容拉开层次
         Gdiplus::RectF shadow((float)g_rBlendBox.left - 3.f, (float)g_rBlendBox.top - 3.f,
                               (float)(g_rBlendBox.right - g_rBlendBox.left) + 6.f,
@@ -5329,14 +5421,15 @@ static void UiPaint(HDC hdc, int W, int H) {
         FillRound(g, shadow, 11.f, Gdiplus::Color(90, 0, 0, 0));
         FillRound(g, toF(g_rBlendBox), 8.f, UIX::CARD2);
         StrokeRound(g, toF(g_rBlendBox), 8.f, UIX::LN);
-        for (int i = 0; i < 8; ++i) {
+        for (int i = 0; i < BM_COUNT; ++i) {
+            const int bm = (int)kBlendOrder[i];      // 第 i 项 → 实际枚举值（展示顺序 ≠ 编号）
             Gdiplus::RectF ri = toF(g_rBlendItem[i]);
-            if (i == mode) FillRound(g, ri, 6.f, Gdiplus::Color(36, 61, 169, 252));
+            if (bm == mode) FillRound(g, ri, 6.f, Gdiplus::Color(36, 61, 169, 252));
             if (g_uiHoverKind == HIT_BLEND_ITEM && g_uiHoverIdx == i)
                 FillRound(g, ri, 6.f, Gdiplus::Color(255, 44, 52, 66));
-            Txt(g, kBlendNames[i], ri.X + 28, ri.Y, ri.Width - 32, ri.Height, g_f11,
-                (i == mode) ? UIX::ACC : UIX::TXT);
-            if (i == mode) {   // 左侧圆点标出当前模式
+            Txt(g, kBlendNames[bm], ri.X + 28, ri.Y, ri.Width - 32, ri.Height, g_f11,
+                (bm == mode) ? UIX::ACC : UIX::TXT);
+            if (bm == mode) {   // 左侧圆点标出当前模式
                 Gdiplus::SolidBrush db(UIX::ACC);
                 g.FillEllipse(&db, ri.X + 13.f, ri.Y + ri.Height*0.5f - 3.f, 6.f, 6.f);
             }
@@ -5359,7 +5452,7 @@ static void UiHitTest(int x, int y) {
     // 展开的下拉列表是浮层：先吃命中，否则它盖住的卡片/行会抢走点击
     if (g_uiBlendOpen) {
         if (InRect(g_rBlend, x, y)) { g_hitKind = HIT_BLEND; return; }
-        for (int i = 0; i < 8; ++i)
+        for (int i = 0; i < BM_COUNT; ++i)
             if (InRect(g_rBlendItem[i], x, y)) { g_hitKind = HIT_BLEND_ITEM; g_hitIdx = i; return; }
         if (InRect(g_rBlendBox, x, y)) return;   // 列表内边距：吃掉，不穿透到下面
     }
@@ -5388,7 +5481,11 @@ static void UiHitTest(int x, int y) {
 // ---------------------------------------------------------------- 时长输入框
 // 自绘 UI 里没有原生 EDIT，点「时长」时临时弹一个 300×120 的小窗，
 // 用的是和设置对话框一样的"注册窗口类 + 模态消息循环"写法。
+// 两种用途共用一个窗口：
+//   g_durDlgTarget = -1  → 改"新加入播放链的默认时长"（dock 上的「时长」按钮，g_uiDurSec）
+//   g_durDlgTarget >= 0  → 改播放链里【这一项】自己的 durationSec（右键行「编辑播放时长」）
 static HWND g_durEdit = nullptr;
+static int  g_durDlgTarget = -1;
 
 static LRESULT CALLBACK DurDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
@@ -5397,7 +5494,9 @@ static LRESULT CALLBACK DurDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Microsoft YaHei");
         HWND lab = CreateWindowW(L"STATIC", L"这一项播放多少秒？（1–3600）", WS_CHILD|WS_VISIBLE,
                                  16,14,260,20, h, nullptr, nullptr, nullptr);
-        wchar_t buf[16]; _snwprintf(buf,16,L"%d", g_uiDurSec);
+        const int initDur = (g_durDlgTarget >= 0 && g_durDlgTarget < (int)g_playlist.size())
+                            ? g_playlist[g_durDlgTarget].durationSec : g_uiDurSec;
+        wchar_t buf[16]; _snwprintf(buf,16,L"%d", initDur);
         g_durEdit = CreateWindowW(L"EDIT", buf, WS_CHILD|WS_VISIBLE|WS_BORDER|ES_NUMBER|ES_AUTOHSCROLL,
                                   16,44,120,26, h, (HMENU)(INT_PTR)1, nullptr, nullptr);
         HWND ok = CreateWindowW(L"BUTTON", L"确定", WS_CHILD|WS_VISIBLE|BS_DEFPUSHBUTTON,
@@ -5416,7 +5515,17 @@ static LRESULT CALLBACK DurDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             int v = _wtoi(buf);
             if (v < 1) v = 1;
             if (v > 3600) v = 3600;
-            g_uiDurSec = v;
+            if (g_durDlgTarget >= 0 && g_durDlgTarget < (int)g_playlist.size()) {
+                // 改播放链里的这一项。若它正是正在播的那条、且已播时间已超新时长，
+                // 下一帧 PLUpdate 会自然进入"等鼓点切换"，不用特判。
+                g_playlist[g_durDlgTarget].durationSec = v;
+                RefreshPlaylistUI();
+                wchar_t st[80];
+                _snwprintf(st, 80, L"第 %d 项播放时长：%d 秒", g_durDlgTarget + 1, v);
+                UiStatus(st);
+            } else {
+                g_uiDurSec = v;
+            }
             DestroyWindow(h);
         } else if (LOWORD(wp) == 3) {
             DestroyWindow(h);
@@ -5427,7 +5536,9 @@ static LRESULT CALLBACK DurDlgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProc(h, msg, wp, lp);
 }
 
-static void ShowDurationDialog(HWND parent) {
+// plIndex = -1：改"新加入播放链的默认时长"；>=0：改播放链里这一项自己的时长。
+static void ShowDurationDialog(HWND parent, int plIndex = -1) {
+    g_durDlgTarget = plIndex;
     static bool reg = false;
     if (!reg) {
         WNDCLASSEXW wc = {}; wc.cbSize = sizeof(wc); wc.lpfnWndProc = DurDlgProc;
@@ -5456,10 +5567,11 @@ static void ShowDurationDialog(HWND parent) {
 
 // 不透明度轨道：把鼠标 x 换算成 0–1 写进选中项（单击跳值和拖动共用这一份）
 static void SetOpacityFromX(int x) {
-    if (g_uiSelPl < 0 || g_uiSelPl >= (int)g_playlist.size()) return;
+    int ti = OpacityTargetIndex();
+    if (ti < 0) return;
     float t = (float)(x - g_rOpTrack.left) / (float)(g_rOpTrack.right - g_rOpTrack.left);
     if (t < 0) t = 0; if (t > 1) t = 1;
-    g_playlist[g_uiSelPl].opacity = t;
+    g_playlist[ti].opacity = t;
     g_blendOpacity = t;
 }
 
@@ -5491,8 +5603,9 @@ static void UiClick(int x, int y) {
     case HIT_BLEND_ITEM:
         if (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size()) {
             auto& item = g_playlist[g_uiSelPl];
-            item.blendMode = (BlendMode)g_hitIdx;
-            g_blendMode = g_hitIdx;
+            const int bm = (int)kBlendOrder[g_hitIdx];   // 列表位置 → 枚举值（展示顺序 ≠ 编号）
+            item.blendMode = (BlendMode)bm;
+            g_blendMode = bm;
             // 混合要叠在一条上层效果上才看得见；没有上层就当场提示去哪设（不然像"点了没反应"）
             if (item.name2.empty())
                 UiStatus(L"混合模式已设置 —— 这一条还没有上层效果，右键画廊卡片选「设为选中项的上层」");
@@ -5680,6 +5793,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             g_uiDragOpacity = true;
             SetCapture(hwnd);
             SetOpacityFromX(x);
+            // 不透明度只作用于上层混合。单层条目拖动时滑块会动、画面却一点不变 ——
+            // 先说清楚，否则看着像"滑块坏了"。
+            int ti = OpacityTargetIndex();
+            if (ti >= 0 && g_playlist[ti].name2.empty())
+                UiStatus(L"不透明度只作用于上层混合 —— 这一条还没有上层效果（右键画廊卡片可选）");
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -5716,17 +5834,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HMENU m = CreatePopupMenu();
             AppendMenuW(m, MF_STRING, 1, L"上移");
             AppendMenuW(m, MF_STRING, 2, L"下移");
+            // 编辑这一项自己的播放时长（按用户要求放在「下移」和「删除这一项」之间）。
+            // 菜单文字带上当前秒数，省得先点开才知道现在多少。
+            wchar_t durMenu[64];
+            const int curDur = (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size())
+                               ? g_playlist[g_uiSelPl].durationSec : 0;
+            _snwprintf(durMenu, 64, L"编辑播放时长（当前 %d 秒）…", curDur);
+            AppendMenuW(m, MF_STRING, 3, durMenu);
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(m, MF_STRING, 3, L"删除这一项");
+            AppendMenuW(m, MF_STRING, 4, L"删除这一项");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(m, MF_STRING, 4, L"清除上层效果");
+            AppendMenuW(m, MF_STRING, 5, L"清除上层效果");
             POINT pt; GetCursorPos(&pt);
             int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, nullptr);
             DestroyMenu(m);
             if (c == 1) PlaylistMoveUp();
             else if (c == 2) PlaylistMoveDown();
-            else if (c == 3) PlaylistRemove();
-            else if (c == 4) PlaylistSetOverlay(-1);
+            else if (c == 3) {
+                if (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size())
+                    ShowDurationDialog(hwnd, g_uiSelPl);
+            }
+            else if (c == 4) PlaylistRemove();
+            else if (c == 5) PlaylistSetOverlay(-1);
             InvalidateRect(hwnd, nullptr, FALSE);
         } else if (g_hitKind == HIT_CARD) {
             // 右键画廊卡片：把它设成【当前选中播放链项】的上层（左键仍是加入播放链）
