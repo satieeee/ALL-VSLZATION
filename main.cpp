@@ -136,6 +136,7 @@ static float  g_hitDrive   = 0.0f;   // 抽插变速：hit 累积的额外相位
 // 【平滑鼓点通道】单记 kick 的包络是个 0.28s 的尖峰，直接拿去推时间轴就是"一冲一停"。
 // uHitFlow 是它再低通一次的结果（起音 τ=0.10s 跟得上鼓，回落 τ=0.60s 像松一口气）；
 // uHitFlowDrive 是它按同样峰值速率积分出来的相位（秒）—— 时间轴用积分，才不会回弹。
+static float  g_hitT         = 0.0f; // uHitt：uHit 的一阶低通（起 0.10s / 落 0.55s）
 static float  g_hitFlow      = 0.0f; // 0..1 当前速率（空闲 0，冲到正常速度 1）
 static float  g_hitFlowDrive = 0.0f; // 秒，速率的积分 —— 时间轴用它，不回弹
 // 【单次运动周期】一记 hit 只开一个周期，周期内再来的 hit 一律忽略（见下方计算处）。
@@ -267,6 +268,8 @@ static const EffectDecl kEffectDecls[] = {
     { L"QKnopic",     EK_FRAG, -1, FAM_LAYERS },
     { L"Loxodrome",   EK_FRAG, -1, FAM_LAYERS },
     { L"rollingsolarsystem", EK_FRAG, -1, FAM_LAYERS },
+    // layers.html 配方落地：S3=双旋镜像，S0/S1/S2/S5 自定义
+    { L"Twincore",    EK_FRAG, -1, FAM_LAYERS },
 };
 
 static const EffectDecl* FindEffectDecl(const wchar_t* n) {
@@ -443,6 +446,9 @@ struct GpuEffect {
             glUniform1f(U("uHitKick"),    g_af.hitKick);
             glUniform1f(U("uHitSnare"),   g_af.hitSnare);
             glUniform1f(U("uHitDrive"),   g_hitDrive);
+            // layers.html 别名：工具页的 uHit = max(hitKick, hitSnare*0.75)（同式上传，见 audio_prelude.glsl）
+            glUniform1f(U("uHit"),        std::max(g_af.hitKick, g_af.hitSnare * 0.75f));
+            glUniform1f(U("uHitt"),       g_hitT);   // uHit 的平滑版（UpdateBeat 里低通）
             glUniform1f(U("uHitFlow"),      g_hitFlow);       // 0..1 平滑鼓点强度
             glUniform1f(U("uHitFlowDrive"), g_hitFlowDrive);  // 秒，它的积分（时间轴用）
             glUniform1f(U("uQ28"),        g_mdQ28);
@@ -668,6 +674,7 @@ static const wchar_t* const kEffectNames[] = {
     L"Loxodrome", L"Pulseblade", L"Indigoflare", L"Indigoflare1", L"Hyperpush",
     L"Rosette", L"Sunslit", L"Starbloom", L"Starbloom2", L"Sporefield",
     L"Silkwheel", L"Marbleflow", L"Hitpetal", L"Hitpulse",
+    L"Twincore",
 };
 static constexpr int kEffectCapacity =
     (int)(sizeof(kEffectNames) / sizeof(kEffectNames[0]));
@@ -2904,6 +2911,8 @@ static void DrawMultiPass(GpuEffect& fx, float t, float bpm, float phase, float 
         glUniform1f(PassU(p, "uQ28"), g_mdQ28);
         glUniform1f(PassU(p, "uHitKick"), g_af.hitKick);
         glUniform1f(PassU(p, "uHitSnare"), g_af.hitSnare);
+        glUniform1f(PassU(p, "uHit"), std::max(g_af.hitKick, g_af.hitSnare * 0.75f));   // layers.html 别名
+        glUniform1f(PassU(p, "uHitt"), g_hitT);                                         // uHit 的平滑版
         BindPassInputs(p, (int)i, (float)w, (float)h);
         glBindVertexArray(g_vao);
         glDrawArrays(GL_TRIANGLES, 0, 6);
@@ -3031,6 +3040,12 @@ static void C3RebaseVeilTime(float shift) {
 
 static void PLUpdate(float dt, float bpm, float phase, bool beat) {
     if (g_plState == PL_STOPPED || g_playlist.empty()) return;
+    // 上层效果每帧跟【正在播放的那一项】同步。原来 g_plEffIdx[1] 只在开播/切项时算，
+    // 播着的时候在 UI 里设/换/清上层要等下一项才生效 —— 看起来就是"设了但看不到"。
+    if (g_plIndex >= 0 && g_plIndex < (int)g_playlist.size()) {
+        int up = g_playlist[g_plIndex].name2.empty() ? -1 : EffectIndex(g_playlist[g_plIndex].name2);
+        if (up != g_plEffIdx[1]) g_plEffIdx[1] = up;
+    }
     // 兜底：不在过渡里就一定是解锁状态（比如过渡中途停了播放链）。
     // 放在最前面 —— 效果切换块会把状态置成 PL_BLUR，那一帧在同一调用里又会上锁，
     // 所以这里不会把刚上的锁清掉。
@@ -4224,6 +4239,28 @@ static void PlaylistStart() {
     ResetTNRenderer();                   // Filigree 同款清零
     ResetXS();                           // Shardstorm 同款清零
     ResetF1Renderer();                   // Function1 同款清零（顺带把入场进度归零 → 重新播入场）
+
+    // ---- 引擎级 GL 资源：同因。设了混合模式后关掉再开播放链必黑屏，就是这里漏了 ----
+    // 混合 FBO 的 EnsureFBO 先比尺寸（w==g_fboW && h==g_fboH 就返回），尺寸缓存不清
+    // → 重开后永不重建，绑的全是旧上下文的死名字 → Pass1/2 画进空 FBO、合成采样空纹理 → 全黑。
+    // 只清句柄和尺寸缓存，不 glDelete：旧对象随上下文没了，delete 无意义；反而新上下文里
+    // 同编号可能已经是别的对象（比如 TransitionFx 的 FBO），误删会连带弄坏它。
+    g_oldFbo = g_oldTex = g_oldDepth = 0;                 // 混合模式 Pass2 的上层纹理
+    g_blendFbo = g_blendTex = g_blendDepth = 0;           // 混合模式 Pass1 的底层纹理
+    g_fboW = g_fboH = 0;
+    g_halfFbo = g_halfTex = 0; g_halfW = g_halfH = 0;     // ⅔ 降采样（Q 键，同款"先比尺寸再重建"）
+    g_fbCurTex = 0;                                       // 帧反馈（F 键 / milk-feedback 强制打开）
+    g_fbPrevFbo = g_fbPrevTex = g_fbNextFbo = g_fbNextTex = 0; g_fbW = g_fbH = 0;
+    g_feedbackProg = 0;
+    g_fbMeshVao = g_fbMeshVbo = g_fbMeshEbo = 0; g_fbMeshICount = 0;
+    g_chainTex[0] = g_chainTex[1] = g_chainFbo[0] = g_chainFbo[1] = 0;   // 多遍效果的 pass 链
+    g_chainW = g_chainH = 0;
+    for (int bi = 0; bi < 3; ++bi) {                      // 引擎模糊链
+        g_blurTex[bi] = g_blurFbo[bi] = g_blurTmpTex[bi] = g_blurTmpFbo[bi] = 0;
+        g_blurW[bi] = g_blurH[bi] = 0;
+    }
+    g_blurProg = 0;
+
     g_pcPalIdx = 0;                      // 调色板也跟着回第一套
     g_pcCurvePos = g_pcCurveTarget = 0.0f;
     g_pcCamYaw = g_pcCamYawT = 0.0f;
@@ -4592,6 +4629,15 @@ static void UpdateBeat() {
     g_hitDrive += ((kHitPumpKick - 1.0f) * af.hitKick
                  + (kHitPumpSnare - 1.0f) * af.hitSnare) * dt;
 
+    // ---- uHitt：uHit 的平滑版（一阶低通，起 0.10s / 落 0.55s）----
+    // uHit = max(kick, snare*0.75) 是瞬时包络；直接推亮度/半径会抖，要"惯性"的效果用它。
+    // 与 layers.html 的 uHitt 同名同义（那边 JS 每帧做同一件事）。
+    {
+        const float hitNow = std::max(af.hitKick, af.hitSnare * 0.75f);
+        const float tau    = (hitNow > g_hitT) ? 0.10f : 0.55f;
+        g_hitT += (hitNow - g_hitT) * (1.0f - std::exp(-dt / tau));
+    }
+
     // ---- 鼓点【单次运动周期】通道（uHitFlow / uHitFlowDrive）----
     //
     // 规则（按用户要求）：
@@ -4772,11 +4818,19 @@ static int  g_uiHoverKind = 0, g_uiHoverIdx = -1;
 // 长按「清空」：按住 1 秒才真正清空播放链（防误触）
 static bool   g_uiHoldClear = false;
 static DWORD  g_uiHoldTick  = 0;
+// 不透明度轨道拖动中（按下 → 捕获鼠标 → 松开释放）
+static bool   g_uiDragOpacity = false;
 
 static RECT g_rChip[8];    static int g_chipFam[8];   static int g_nChip = 0;
 static RECT g_rRow[16];    static int g_nRow = 0;
 static int  g_rowPl[16] = {0};   // 每行对应播放链里的第几项
 static RECT g_rPlay, g_rStop, g_rBlend, g_rOpTrack, g_rDur, g_rClear, g_rSet, g_rPreset[5];
+// 混合模式下拉：点「混合」展开 8 个模式让用户挑，不再每点一次轮换下一个
+static bool g_uiBlendOpen = false;
+static RECT g_rBlendBox, g_rBlendItem[8];
+static const wchar_t* kBlendNames[8] = {
+    L"无混合", L"变亮", L"滤色", L"叠加", L"强光", L"柔光", L"线性加深", L"正片叠底"
+};
 
 static const int  kMargin = 24, kGap = 12, kCols = 4, kCardH = 150;
 static const int  kGridTop = 96;
@@ -4867,6 +4921,18 @@ static void UiBuild(int W, int H) {
     g_rPlay  = { px, kDockTop + 44, px + 150, kDockTop + 88 };
     g_rStop  = { px + 158, kDockTop + 44, px + pw, kDockTop + 88 };
     g_rBlend = { px, kDockTop + 96, px + pw, kDockTop + 134 };
+    // 下拉列表锚在按钮左缘、【向上】展开 —— dock 贴着窗口底，往下展开会出屏。
+    // 列表不必和按钮一样宽（按钮很宽是因为要占满右栏），168 够放最长的“线性加深”+ 高亮圆点。
+    {
+        const int rowH = 26, boxW = 168, padY = 6;
+        int bottom = g_rBlend.top - 6;
+        int top = bottom - (8 * rowH + 2 * padY);
+        g_rBlendBox = { g_rBlend.left, top, g_rBlend.left + boxW, bottom };
+        for (int i = 0; i < 8; ++i) {
+            int y = top + padY + i * rowH;
+            g_rBlendItem[i] = { g_rBlend.left + 6, y, g_rBlend.left + boxW - 6, y + rowH };
+        }
+    }
     g_rOpTrack = { px + 78, kDockTop + 146, px + pw - 46, kDockTop + 154 };
     g_rDur   = { 400, kDockTop + 8, 500, kDockTop + 36 };
     g_rClear = { 508, kDockTop + 8, 588, kDockTop + 36 };
@@ -5005,7 +5071,7 @@ static void ThumbPump(int budget) {
 
 // ---- 命中与点击 ----
 enum { HIT_NONE = 0, HIT_CHIP, HIT_CARD, HIT_ROW, HIT_PLAY, HIT_STOP, HIT_BLEND,
-       HIT_OPACITY, HIT_DUR, HIT_SET, HIT_PRESET, HIT_CLEAR };
+       HIT_BLEND_ITEM, HIT_OPACITY, HIT_DUR, HIT_SET, HIT_PRESET, HIT_CLEAR };
 static int g_hitKind = HIT_NONE, g_hitIdx = -1;
 
 // ---- 绘制 ----
@@ -5178,8 +5244,11 @@ static void UiPaint(HDC hdc, int W, int H) {
             Txt(g, idx, r.X + 14, r.Y, 40, r.Height, g_f10, sel ? UIX::ACC : UIX::DIM);
             Txt(g, it.name.c_str(), r.X + 52, r.Y + 1, r.Width - 220, 20, g_f13, UIX::TXT);
             wchar_t sub[160];
-            _snwprintf(sub, 160, L"%s%s · %d 秒", FamName(EffFamily(EffectIndex(it.name))),
-                       it.name2.empty() ? L"" : L" + 上层", it.durationSec);
+            if (it.name2.empty())
+                _snwprintf(sub, 160, L"%s · %d 秒", FamName(EffFamily(EffectIndex(it.name))), it.durationSec);
+            else
+                _snwprintf(sub, 160, L"%s + %s · %d 秒", FamName(EffFamily(EffectIndex(it.name))),
+                           it.name2.c_str(), it.durationSec);
             Txt(g, sub, r.X + 52, r.Y + 20, r.Width - 220, 16, g_f10, UIX::DIM);
             wchar_t dur[16]; _snwprintf(dur, 16, L"%ds", it.durationSec);
             Txt(g, dur, r.X + r.Width - 58, r.Y, 44, r.Height, g_f10, UIX::MUTED, 2);
@@ -5213,17 +5282,22 @@ static void UiPaint(HDC hdc, int W, int H) {
             Txt(g, L"停止", rs.X + 44, rs.Y, rs.Width - 50, rs.Height, g_f13, UIX::MUTED);
         }
 
-        {   // 混合
-            const wchar_t* bms[] = {L"无混合",L"变亮",L"滤色",L"叠加",L"强光",L"柔光",L"线性加深",L"正片叠底"};
+        {   // 混合（单击展开下拉列表）
             int mode = (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size()) ? (int)g_playlist[g_uiSelPl].blendMode : 0;
             if (mode < 0 || mode > 7) mode = 0;
             Gdiplus::RectF r((float)g_rBlend.left, (float)g_rBlend.top,
                              (float)(g_rBlend.right-g_rBlend.left), (float)(g_rBlend.bottom-g_rBlend.top));
             bool hovB = (g_uiHoverKind == HIT_BLEND);
-            FillRound(g, r, 8.f, hovB ? UIX::CARD2 : UIX::CARD);
-            StrokeRound(g, r, 8.f, hovB ? Gdiplus::Color(255,70,80,96) : UIX::LN);
+            FillRound(g, r, 8.f, (hovB || g_uiBlendOpen) ? UIX::CARD2 : UIX::CARD);
+            StrokeRound(g, r, 8.f, g_uiBlendOpen ? UIX::ACC : (hovB ? Gdiplus::Color(255,70,80,96) : UIX::LN));
             Txt(g, L"混合", r.X + 12, r.Y, 60, r.Height, g_f10, UIX::DIM);
-            Txt(g, bms[mode], r.X + 60, r.Y, r.Width - 72, r.Height, g_f11, UIX::TXT);
+            Txt(g, kBlendNames[mode], r.X + 60, r.Y, r.Width - 100, r.Height, g_f11, UIX::TXT);
+            // 右端小三角：看得出这里能展开（不是每点一次换一个）
+            Gdiplus::PointF car[3] = { { r.X + r.Width - 28.f, r.Y + r.Height*0.5f - 2.f },
+                                       { r.X + r.Width - 16.f, r.Y + r.Height*0.5f - 2.f },
+                                       { r.X + r.Width - 22.f, r.Y + r.Height*0.5f + 4.f } };
+            Gdiplus::SolidBrush cb(UIX::DIM);
+            g.FillPolygon(&cb, car, 3);
         }
 
         {   // 不透明度
@@ -5240,6 +5314,35 @@ static void UiPaint(HDC hdc, int W, int H) {
         }
     }
 
+    // 混合模式下拉列表：画在 dock 之后 → 盖在画廊和 dock 之上（命中见 UiHitTest）
+    if (g_uiBlendOpen) {
+        auto toF = [](const RECT& r) {
+            return Gdiplus::RectF((float)r.left, (float)r.top,
+                                  (float)(r.right - r.left), (float)(r.bottom - r.top));
+        };
+        int mode = (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size()) ? (int)g_playlist[g_uiSelPl].blendMode : 0;
+        if (mode < 0 || mode > 7) mode = 0;
+        // 一圈放大 3px 的半透明框当阴影（GDI+ 没有真阴影），和下面的内容拉开层次
+        Gdiplus::RectF shadow((float)g_rBlendBox.left - 3.f, (float)g_rBlendBox.top - 3.f,
+                              (float)(g_rBlendBox.right - g_rBlendBox.left) + 6.f,
+                              (float)(g_rBlendBox.bottom - g_rBlendBox.top) + 6.f);
+        FillRound(g, shadow, 11.f, Gdiplus::Color(90, 0, 0, 0));
+        FillRound(g, toF(g_rBlendBox), 8.f, UIX::CARD2);
+        StrokeRound(g, toF(g_rBlendBox), 8.f, UIX::LN);
+        for (int i = 0; i < 8; ++i) {
+            Gdiplus::RectF ri = toF(g_rBlendItem[i]);
+            if (i == mode) FillRound(g, ri, 6.f, Gdiplus::Color(36, 61, 169, 252));
+            if (g_uiHoverKind == HIT_BLEND_ITEM && g_uiHoverIdx == i)
+                FillRound(g, ri, 6.f, Gdiplus::Color(255, 44, 52, 66));
+            Txt(g, kBlendNames[i], ri.X + 28, ri.Y, ri.Width - 32, ri.Height, g_f11,
+                (i == mode) ? UIX::ACC : UIX::TXT);
+            if (i == mode) {   // 左侧圆点标出当前模式
+                Gdiplus::SolidBrush db(UIX::ACC);
+                g.FillEllipse(&db, ri.X + 13.f, ri.Y + ri.Height*0.5f - 3.f, 6.f, 6.f);
+            }
+        }
+    }
+
     Txt(g, g_uiStatus.c_str(), (float)kMargin, (float)H - 18.f, (float)W - 2*kMargin, 16.f, g_f10, UIX::DIM);
 
     BitBlt(hdc, 0, 0, W, H, g_dibDC, 0, 0, SRCCOPY);
@@ -5253,6 +5356,13 @@ static bool InRect(const RECT& r, int x, int y) {
 
 static void UiHitTest(int x, int y) {
     g_hitKind = HIT_NONE; g_hitIdx = -1;
+    // 展开的下拉列表是浮层：先吃命中，否则它盖住的卡片/行会抢走点击
+    if (g_uiBlendOpen) {
+        if (InRect(g_rBlend, x, y)) { g_hitKind = HIT_BLEND; return; }
+        for (int i = 0; i < 8; ++i)
+            if (InRect(g_rBlendItem[i], x, y)) { g_hitKind = HIT_BLEND_ITEM; g_hitIdx = i; return; }
+        if (InRect(g_rBlendBox, x, y)) return;   // 列表内边距：吃掉，不穿透到下面
+    }
     if (y >= kGridTop && y < kGridBottom)
         for (int i = 0; i < g_nCard; ++i)
             if (InRect(g_rCard[i], x, y)) { g_hitKind = HIT_CARD; g_hitIdx = i; return; }
@@ -5263,7 +5373,11 @@ static void UiHitTest(int x, int y) {
     if (InRect(g_rPlay, x, y))  { g_hitKind = HIT_PLAY;  return; }
     if (InRect(g_rStop, x, y))  { g_hitKind = HIT_STOP;  return; }
     if (InRect(g_rBlend, x, y)) { g_hitKind = HIT_BLEND; return; }
-    if (InRect(g_rOpTrack, x, y)) { g_hitKind = HIT_OPACITY; return; }
+    // 轨道只有 8px 高，实际可点区域上下各放宽 8px（滑块本身还有 ±7px 探出轨道）
+    {
+        RECT rop = { g_rOpTrack.left - 8, g_rOpTrack.top - 8, g_rOpTrack.right + 8, g_rOpTrack.bottom + 8 };
+        if (InRect(rop, x, y)) { g_hitKind = HIT_OPACITY; return; }
+    }
     if (InRect(g_rDur, x, y))   { g_hitKind = HIT_DUR;   return; }
     if (InRect(g_rClear, x, y)) { g_hitKind = HIT_CLEAR; return; }
     if (InRect(g_rSet, x, y))   { g_hitKind = HIT_SET;   return; }
@@ -5340,6 +5454,15 @@ static void ShowDurationDialog(HWND parent) {
     InvalidateRect(parent, nullptr, FALSE);
 }
 
+// 不透明度轨道：把鼠标 x 换算成 0–1 写进选中项（单击跳值和拖动共用这一份）
+static void SetOpacityFromX(int x) {
+    if (g_uiSelPl < 0 || g_uiSelPl >= (int)g_playlist.size()) return;
+    float t = (float)(x - g_rOpTrack.left) / (float)(g_rOpTrack.right - g_rOpTrack.left);
+    if (t < 0) t = 0; if (t > 1) t = 1;
+    g_playlist[g_uiSelPl].opacity = t;
+    g_blendOpacity = t;
+}
+
 static void UiClick(int x, int y) {
     RECT rc; GetClientRect(g_hwnd, &rc);
     UiBuild(rc.right, rc.bottom);
@@ -5358,20 +5481,27 @@ static void UiClick(int x, int y) {
         break;
     case HIT_PLAY:  PlaylistStart(); break;
     case HIT_STOP:  PlaylistStop();  break;
-    case HIT_BLEND:
-        if (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size()) {
-            int m = ((int)g_playlist[g_uiSelPl].blendMode + 1) % 8;
-            g_playlist[g_uiSelPl].blendMode = (BlendMode)m;
-            g_blendMode = m;
+    case HIT_BLEND:   // 单击展开/收起下拉列表
+        g_uiBlendOpen = !g_uiBlendOpen;
+        if (g_uiBlendOpen && !(g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size())) {
+            g_uiBlendOpen = false;   // 没选中播放链条目就没有可改的对象
+            UiStatus(L"先在播放链里选中一项，再改它的混合模式");
         }
         break;
-    case HIT_OPACITY:
+    case HIT_BLEND_ITEM:
         if (g_uiSelPl >= 0 && g_uiSelPl < (int)g_playlist.size()) {
-            float t = (float)(x - g_rOpTrack.left) / (float)(g_rOpTrack.right - g_rOpTrack.left);
-            if (t < 0) t = 0; if (t > 1) t = 1;
-            g_playlist[g_uiSelPl].opacity = t;
-            g_blendOpacity = t;
+            auto& item = g_playlist[g_uiSelPl];
+            item.blendMode = (BlendMode)g_hitIdx;
+            g_blendMode = g_hitIdx;
+            // 混合要叠在一条上层效果上才看得见；没有上层就当场提示去哪设（不然像"点了没反应"）
+            if (item.name2.empty())
+                UiStatus(L"混合模式已设置 —— 这一条还没有上层效果，右键画廊卡片选「设为选中项的上层」");
         }
+        g_uiBlendOpen = false;
+        g_uiHoverKind = HIT_NONE; g_uiHoverIdx = -1;
+        break;
+    case HIT_OPACITY:
+        SetOpacityFromX(x);
         break;
     case HIT_DUR:
         ShowDurationDialog(g_hwnd);   // 任意秒数，不再是固定几档
@@ -5381,6 +5511,36 @@ static void UiClick(int x, int y) {
     default: break;
     }
     InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// 给选中的播放链项设「上层效果」（Photoshop 混合叠在上面的那层），effIdx < 0 = 清除。
+// 上层只收 Normal / Layers 族 —— 与随机播放链的混层判据一致（EffIsMixable），
+// 那两类走同一条整屏 shader 渲染路径，叠出来的整帧才有意义。
+static void PlaylistSetOverlay(int effIdx) {
+    if (g_uiSelPl < 0 || g_uiSelPl >= (int)g_playlist.size()) {
+        UiStatus(L"先在播放链里选中一项，再设它的上层效果");
+        return;
+    }
+    auto& it = g_playlist[g_uiSelPl];
+    if (effIdx < 0) {
+        it.name2.clear();
+        it.blendMode = BM_None;
+        UiStatus(L"已清除上层效果");
+        return;
+    }
+    if (!EffIsMixable(effIdx)) {
+        UiStatus(L"Metalheart / Cube / 3D 族只能单独成条，不能当上层");
+        return;
+    }
+    if (g_effects[effIdx].name == it.name) {
+        UiStatus(L"上层不能和底层是同一个效果");
+        return;
+    }
+    it.name2 = g_effects[effIdx].name;
+    if (it.blendMode == BM_None) it.blendMode = BM_Screen;   // 有了上层先给个默认算法，不然叠了也看不出
+    wchar_t st[160];
+    _snwprintf(st, 160, L"上层：%s（混合 %s）", it.name2.c_str(), kBlendNames[(int)it.blendMode]);
+    UiStatus(st);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -5470,6 +5630,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
         RECT rc; GetClientRect(hwnd, &rc);
         UiBuild(rc.right, rc.bottom);
+        if (g_uiDragOpacity) {          // 拖动中：x 直接换算成不透明度（超出轨道两端会被夹到 0/100%）
+            SetOpacityFromX(x);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         UiHitTest(x, y);
         if (g_hitKind != g_uiHoverKind || g_hitIdx != g_uiHoverIdx) {
             g_uiHoverKind = g_hitKind; g_uiHoverIdx = g_hitIdx;
@@ -5489,14 +5654,32 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_uiHoverKind != HIT_NONE) { g_uiHoverKind = HIT_NONE; g_uiHoverIdx = -1; InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
 
+    case WM_CAPTURECHANGED:
+        g_uiDragOpacity = false;   // 捕获被别人抢走（弹菜单/切窗口）时结束拖动，避免没按键也跟手
+        return 0;
+
     case WM_LBUTTONDOWN: {
         int x = GET_X_LPARAM(lParam), y = GET_Y_LPARAM(lParam);
         RECT rc; GetClientRect(hwnd, &rc);
         UiBuild(rc.right, rc.bottom);
         UiHitTest(x, y);
+        // 下拉展开时点列表项/按钮以外的地方 = 先收起列表（这一下不触发别的操作）
+        if (g_uiBlendOpen && g_hitKind != HIT_BLEND_ITEM && g_hitKind != HIT_BLEND) {
+            g_uiBlendOpen = false;
+            g_uiHoverKind = HIT_NONE; g_uiHoverIdx = -1;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         if (g_hitKind == HIT_CLEAR) {          // 清空按钮走"长按 1 秒"，不即时生效
             g_uiHoldClear = true; g_uiHoldTick = GetTickCount();
             SetCapture(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        if (g_hitKind == HIT_OPACITY) {        // 不透明度：按下即跳值，拖动持续跟随
+            g_uiDragOpacity = true;
+            SetCapture(hwnd);
+            SetOpacityFromX(x);
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
@@ -5505,6 +5688,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_LBUTTONUP: {
+        if (g_uiDragOpacity) {
+            g_uiDragOpacity = false;
+            ReleaseCapture();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         if (g_uiHoldClear) {
             DWORD el = GetTickCount() - g_uiHoldTick;
             g_uiHoldClear = false;
@@ -5523,18 +5712,36 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         UiBuild(rc.right, rc.bottom);
         UiHitTest(x, y);
         if (g_hitKind == HIT_ROW) {
-            g_uiSelPl = g_hitIdx;
+            if (g_hitIdx >= 0 && g_hitIdx < g_nRow) g_uiSelPl = g_rowPl[g_hitIdx];   // 行号→播放链序号（滚动后两者不等）
             HMENU m = CreatePopupMenu();
             AppendMenuW(m, MF_STRING, 1, L"上移");
             AppendMenuW(m, MF_STRING, 2, L"下移");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(m, MF_STRING, 3, L"删除这一项");
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING, 4, L"清除上层效果");
             POINT pt; GetCursorPos(&pt);
             int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, nullptr);
             DestroyMenu(m);
             if (c == 1) PlaylistMoveUp();
             else if (c == 2) PlaylistMoveDown();
             else if (c == 3) PlaylistRemove();
+            else if (c == 4) PlaylistSetOverlay(-1);
+            InvalidateRect(hwnd, nullptr, FALSE);
+        } else if (g_hitKind == HIT_CARD) {
+            // 右键画廊卡片：把它设成【当前选中播放链项】的上层（左键仍是加入播放链）
+            int eff = (g_hitIdx >= 0 && g_hitIdx < g_nCard) ? g_cardEff[g_hitIdx] : -1;
+            HMENU m = CreatePopupMenu();
+            AppendMenuW(m, MF_STRING, 1, L"设为选中项的上层");
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING, 2, L"加到播放链末尾");
+            POINT pt; GetCursorPos(&pt);
+            int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, nullptr);
+            DestroyMenu(m);
+            if (eff >= 0) {
+                if (c == 1) PlaylistSetOverlay(eff);
+                else if (c == 2) { g_uiSelEffect = eff; PlaylistAdd(); }
+            }
             InvalidateRect(hwnd, nullptr, FALSE);
         } else if (g_hitKind == HIT_PRESET) {
             int s = g_hitIdx;
@@ -5620,7 +5827,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_HSCROLL: {
         int op=(int)SendMessageW(GetDlgItem(g_hwnd,IDC_TRACK_OPACITY),TBM_GETPOS,0,0);g_blendOpacity=(float)op/100.0f;int ps=(int)SendMessageW(g_hPlaylist,LB_GETCURSEL,0,0);if(ps>=0&&ps<(int)g_playlist.size()){g_playlist[ps].opacity=g_blendOpacity;}wchar_t buf[16];_snwprintf(buf,16,L"%d%%",op);SetWindowTextW(GetDlgItem(g_hwnd,IDC_STATIC_OPACITY),buf);}return 0;
 
-    case WM_KEYDOWN: if(wParam==VK_ESCAPE)DestroyWindow(hwnd); return 0;
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            if (g_uiBlendOpen) {   // Esc 先收起混合模式列表，不关程序
+                g_uiBlendOpen = false;
+                g_uiHoverKind = HIT_NONE; g_uiHoverIdx = -1;
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
+            DestroyWindow(hwnd);
+        }
+        return 0;
     case WM_SIZE: {RECT rc;GetClientRect(hwnd,&rc);SetWindowPos(g_hStatus,nullptr,0,rc.bottom-22,rc.right,22,SWP_NOZORDER);return 0;}
     case WM_DESTROY: PlaylistStop();KillTimer(hwnd,TIMER_INIT);KillTimer(hwnd,TIMER_MAIN);g_audio.Shutdown();PostQuitMessage(0);return 0;
     }

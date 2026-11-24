@@ -35,6 +35,17 @@ uniform float uAudioPhase;       // 音频驱动旋转相位（CPU 累计：变�
 uniform float uHitKick, uHitSnare, uHitDrive;
 uniform float uHitFlow, uHitFlowDrive;
 
+// ---- layers.html 兼容别名 ----
+// 工具页的 HEAD 里有一个合并包络 uHit = max(hitKick, hitSnare * 0.75)。
+// 从 layers.html 直接抄过来的配方都按这个名字写，所以这里给它一个同名 uniform，
+// 由 main.cpp 每帧按同一公式上传，配方不用改名就能编译。
+// 注意：工具页【没接音频】时会用合成脉冲兜底；引擎这边没有音频就是 0（不伪造鼓点）。
+uniform float uHit;
+
+// uHit 的平滑版（一阶低通：起 τ=0.10s / 落 τ=0.55s）。瞬时包络直接推亮度/半径会抖，
+// 要"有惯性"的驱动就用它。与 layers.html 的 uHitt 同名同义（那边 JS 每帧同样做一次低通）。
+uniform float uHitt;
+
 // ============================================================================
 // 频谱形状描述子（2026-09-14 新增）—— 描述【音色】而不是响度
 //
